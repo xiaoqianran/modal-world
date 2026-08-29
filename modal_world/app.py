@@ -301,7 +301,22 @@ def worldgen_case000_stage1() -> dict:
         if old_mesh_cleanup not in panorama_source:
             raise RuntimeError("expected upstream Open3D mesh cleanup block not found")
         panorama_source = panorama_source.replace(old_mesh_cleanup, new_mesh_cleanup, 1)
+        mesh_resolution_old = "mesh_h, mesh_w = 960, 1920"
+        mesh_resolution_new = "mesh_h, mesh_w = 480, 960  # modal-world single-GPU WorldNav mesh"
+        if (
+            mesh_resolution_old not in panorama_source
+            and mesh_resolution_old not in (worldgen_root / "traj_generate.py").read_text()
+        ):
+            raise RuntimeError("expected upstream WorldNav mesh resolution not found")
         panorama_utils.write_text(panorama_source)
+        traj_source = (worldgen_root / "traj_generate.py").read_text()
+        if mesh_resolution_old not in traj_source:
+            raise RuntimeError(
+                "expected upstream WorldNav mesh resolution not found in traj_generate.py"
+            )
+        (worldgen_root / "traj_generate.py").write_text(
+            traj_source.replace(mesh_resolution_old, mesh_resolution_new, 1)
+        )
 
         log_path = target / "stage1.log"
         command = [
