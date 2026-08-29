@@ -305,13 +305,11 @@ def worldgen_case000_stage1() -> dict:
         mesh_assign_old = """    mesh = o3d.geometry.TriangleMesh()
     mesh.vertices = o3d.utility.Vector3dVector(vertices_np)
     mesh.triangles = o3d.utility.Vector3iVector(faces_np)
-    if vertex_colors_np is not None:
-        mesh.vertex_colors = o3d.utility.Vector3dVector(vertex_colors_np)
+    mesh.vertex_colors = o3d.utility.Vector3dVector(colors_np)
 """
         mesh_assign_new = """    vertices_np = np.ascontiguousarray(vertices_np, dtype=np.float64)
     faces_np = np.ascontiguousarray(faces_np, dtype=np.int32)
-    if vertex_colors_np is not None:
-        vertex_colors_np = np.ascontiguousarray(vertex_colors_np, dtype=np.float64)
+    colors_np = np.ascontiguousarray(colors_np, dtype=np.float64)
     if vertices_np.ndim != 2 or vertices_np.shape[1] != 3:
         raise RuntimeError(f"invalid panorama mesh vertex shape: {vertices_np.shape}")
     if not np.isfinite(vertices_np).all():
@@ -323,10 +321,13 @@ def worldgen_case000_stage1() -> dict:
         raise RuntimeError(
             f"panorama mesh face index out of range: min={faces_np.min()} max={faces_np.max()} vertices={len(vertices_np)}"
         )
+    if colors_np.shape != vertices_np.shape:
+        raise RuntimeError(f"panorama mesh color shape mismatch: {colors_np.shape} vs {vertices_np.shape}")
     print(
         f"[modal-world] mesh precheck: vertices={vertices_np.shape} dtype={vertices_np.dtype} "
         f"contiguous={vertices_np.flags.c_contiguous} min={vertices_np.min(axis=0).tolist()} "
-        f"max={vertices_np.max(axis=0).tolist()} faces={faces_np.shape} face_min={int(faces_np.min()) if faces_np.size else -1} "
+        f"max={vertices_np.max(axis=0).tolist()} faces={faces_np.shape} "
+        f"face_min={int(faces_np.min()) if faces_np.size else -1} "
         f"face_max={int(faces_np.max()) if faces_np.size else -1}",
         flush=True,
     )
@@ -356,9 +357,8 @@ def worldgen_case000_stage1() -> dict:
     print("[modal-world] Open3D Vector3dVector ok", flush=True)
     mesh.triangles = o3d.utility.Vector3iVector(faces_np)
     print("[modal-world] Open3D Vector3iVector ok", flush=True)
-    if vertex_colors_np is not None:
-        mesh.vertex_colors = o3d.utility.Vector3dVector(vertex_colors_np)
-        print("[modal-world] Open3D vertex colors ok", flush=True)
+    mesh.vertex_colors = o3d.utility.Vector3dVector(colors_np)
+    print("[modal-world] Open3D vertex colors ok", flush=True)
 """
         if mesh_assign_old not in panorama_source:
             raise RuntimeError("expected upstream Open3D mesh assignment block not found")
