@@ -717,6 +717,165 @@ def preload_worldstereo_stage3_weights() -> dict:
 
 @app.function(
     image=hyworld2_worldgen_stage3_image,
+    cpu=4.0,
+    memory=16384,
+    volumes={"/models": model_cache},
+    secrets=[hf_secret],
+    timeout=30 * 60,
+)
+def verify_worldstereo_stage3_cache() -> dict:
+    """Verify Stage 3 assets are complete and resolvable with networking disabled."""
+    import json
+    import os
+    import time
+    from pathlib import Path
+
+    os.environ["HF_HOME"] = "/models/huggingface"
+    os.environ["HUGGINGFACE_HUB_CACHE"] = "/models/huggingface/hub"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["DIFFUSERS_OFFLINE"] = "1"
+
+    from diffusers import AutoencoderKLWan, WanTransformer3DModel
+    from diffusers.schedulers import UniPCMultistepScheduler
+    from huggingface_hub import hf_hub_download, snapshot_download
+    from transformers import AutoConfig, CLIPImageProcessor, T5TokenizerFast
+
+    worldstereo_repo = "hanshanxue/WorldStereo"
+    wan_repo = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+    report_path = Path("/models/stage3_cache_verify.json")
+    report = {"offline": True, "steps": {}, "required_paths": {}}
+    started = time.perf_counter()
+
+    def checked(name, func):
+        step_started = time.perf_counter()
+        value = func()
+        report["steps"][name] = {"elapsed_s": round(time.perf_counter() - step_started, 3)}
+        report_path.write_text(json.dumps(report, indent=2, default=str) + "\n")
+        model_cache.commit()
+        return value
+
+    wan_allow_patterns = [
+        "model_index.json",
+        "transformer/**",
+        "text_encoder/**",
+        "image_encoder/**",
+        "image_processor/**",
+        "tokenizer/**",
+        "vae/**",
+        "scheduler/**",
+    ]
+
+    report["required_paths"]["worldstereo_config"] = checked(
+        "worldstereo_config",
+        lambda: hf_hub_download(
+            worldstereo_repo,
+            "config.json",
+            subfolder="worldstereo-memory-dmd",
+            local_files_only=True,
+        ),
+    )
+    report["required_paths"]["worldstereo_weights"] = checked(
+        "worldstereo_weights",
+        lambda: hf_hub_download(
+            worldstereo_repo,
+            "model.safetensors",
+            subfolder="worldstereo-memory-dmd",
+            local_files_only=True,
+        ),
+    )
+    report["required_paths"]["wan_snapshot"] = checked(
+        "wan_snapshot",
+        lambda: snapshot_download(
+            wan_repo,
+            allow_patterns=wan_allow_patterns,
+            local_files_only=True,
+        ),
+    )
+    report["required_paths"]["moge_snapshot"] = checked(
+        "moge_snapshot",
+        lambda: snapshot_download("Ruicheng/moge-2-vitl-normal", local_files_only=True),
+    )
+    report["required_paths"]["sam3_snapshot"] = checked(
+        "sam3_snapshot",
+        lambda: snapshot_download("facebook/sam3", local_files_only=True),
+    )
+
+    checked(
+        "wan_transformer_config",
+        lambda: WanTransformer3DModel.load_config(
+            wan_repo, subfolder="transformer", local_files_only=True
+        ),
+    )
+    checked(
+        "wan_vae_config",
+        lambda: AutoencoderKLWan.load_config(wan_repo, subfolder="vae", local_files_only=True),
+    )
+    checked(
+        "wan_scheduler_config",
+        lambda: UniPCMultistepScheduler.load_config(
+            wan_repo, subfolder="scheduler", local_files_only=True
+        ),
+    )
+    checked(
+        "wan_text_encoder_config",
+        lambda: AutoConfig.from_pretrained(
+            wan_repo, subfolder="text_encoder", local_files_only=True
+        ),
+    )
+    checked(
+        "wan_image_encoder_config",
+        lambda: AutoConfig.from_pretrained(
+            wan_repo, subfolder="image_encoder", local_files_only=True
+        ),
+    )
+    checked(
+        "wan_tokenizer",
+        lambda: T5TokenizerFast.from_pretrained(
+            wan_repo, subfolder="tokenizer", local_files_only=True
+        ),
+    )
+    checked(
+        "wan_image_processor",
+        lambda: CLIPImageProcessor.from_pretrained(
+            wan_repo, subfolder="image_processor", local_files_only=True
+        ),
+    )
+
+    cache = Path("/models/huggingface/hub")
+    repo_dirs = {
+        "worldstereo": cache / "models--hanshanxue--WorldStereo" / "blobs",
+        "wan": cache / "models--Wan-AI--Wan2.1-I2V-14B-480P-Diffusers" / "blobs",
+        "moge": cache / "models--Ruicheng--moge-2-vitl-normal" / "blobs",
+        "sam3": cache / "models--facebook--sam3" / "blobs",
+    }
+    blob_bytes = {}
+    blob_files = {}
+    for name, root in repo_dirs.items():
+        files = [
+            path for path in root.iterdir() if path.is_file() and not path.name.endswith(".lock")
+        ]
+        if not files:
+            raise RuntimeError(f"empty Hugging Face blob cache for {name}: {root}")
+        blob_files[name] = len(files)
+        blob_bytes[name] = sum(path.stat().st_size for path in files)
+
+    report.update(
+        {
+            "success": True,
+            "blob_bytes": blob_bytes,
+            "blob_files": blob_files,
+            "total_blob_bytes": sum(blob_bytes.values()),
+            "elapsed_s": round(time.perf_counter() - started, 3),
+        }
+    )
+    report_path.write_text(json.dumps(report, indent=2, default=str) + "\n")
+    model_cache.commit()
+    return report
+
+
+@app.function(
+    image=hyworld2_worldgen_stage3_image,
     gpu=GPU,
     cpu=16.0,
     memory=131072,
@@ -760,6 +919,9 @@ def worldgen_case000_stage3() -> dict:
             raise RuntimeError(f"empty Stage 2 caption: {caption}")
 
     worldgen_root = Path(HYWORLD2_SOURCE) / "hyworld2/worldgen"
+    from modal_world.worldstereo_patch import patch_worldstereo_wrapper
+
+    patch_worldstereo_wrapper(worldgen_root / "models/worldstereo_wrapper.py")
     log_path = target / "stage3.log"
     timing_path = target / "stage3_timing.json"
     command = [
