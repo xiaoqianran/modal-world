@@ -689,6 +689,7 @@ def preload_worldstereo_stage3_weights() -> dict:
         ),
         ("Ruicheng/moge-2-vitl-normal", None),
         ("facebook/sam3", None),
+        ("facebook/dinov2-base", None),
     ]
     for repo_id, allow_patterns in specs:
         repo_started = time.perf_counter()
@@ -739,7 +740,7 @@ def verify_worldstereo_stage3_cache() -> dict:
     from diffusers import AutoencoderKLWan, WanTransformer3DModel
     from diffusers.schedulers import UniPCMultistepScheduler
     from huggingface_hub import hf_hub_download, snapshot_download
-    from transformers import AutoConfig, CLIPImageProcessor, T5TokenizerFast
+    from transformers import AutoConfig, AutoImageProcessor, CLIPImageProcessor, T5TokenizerFast
 
     worldstereo_repo = "hanshanxue/WorldStereo"
     wan_repo = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
@@ -800,6 +801,21 @@ def verify_worldstereo_stage3_cache() -> dict:
         "sam3_snapshot",
         lambda: snapshot_download("facebook/sam3", local_files_only=True),
     )
+    report["required_paths"]["dinov2_snapshot"] = checked(
+        "dinov2_snapshot",
+        lambda: snapshot_download("facebook/dinov2-base", local_files_only=True),
+    )
+
+    checked(
+        "dinov2_config",
+        lambda: AutoConfig.from_pretrained("facebook/dinov2-base", local_files_only=True),
+    )
+    checked(
+        "dinov2_image_processor",
+        lambda: AutoImageProcessor.from_pretrained(
+            "facebook/dinov2-base", use_fast=True, local_files_only=True
+        ),
+    )
 
     checked(
         "wan_transformer_config",
@@ -848,6 +864,7 @@ def verify_worldstereo_stage3_cache() -> dict:
         "wan": cache / "models--Wan-AI--Wan2.1-I2V-14B-480P-Diffusers" / "blobs",
         "moge": cache / "models--Ruicheng--moge-2-vitl-normal" / "blobs",
         "sam3": cache / "models--facebook--sam3" / "blobs",
+        "dinov2": cache / "models--facebook--dinov2-base" / "blobs",
     }
     blob_bytes = {}
     blob_files = {}
@@ -922,6 +939,31 @@ def worldgen_case000_stage3() -> dict:
     from modal_world.worldstereo_patch import patch_worldstereo_wrapper
 
     patch_worldstereo_wrapper(worldgen_root / "models/worldstereo_wrapper.py")
+
+    retrieval_path = worldgen_root / "src/retrieval_wm.py"
+    retrieval_source = retrieval_path.read_text()
+    dino_processor_old = "            self.processor = AutoImageProcessor.from_pretrained(model_path, use_fast=True)\n"
+    dino_processor_new = (
+        "            self.processor = AutoImageProcessor.from_pretrained(\n"
+        "                model_path, use_fast=True, local_files_only=True\n"
+        "            )\n"
+    )
+    dino_model_old = (
+        "            self.model = AutoModel.from_pretrained(model_path).to(self.device)\n"
+    )
+    dino_model_new = (
+        "            self.model = AutoModel.from_pretrained(\n"
+        "                model_path, local_files_only=True\n"
+        "            ).to(self.device)\n"
+    )
+    if retrieval_source.count(dino_processor_old) != 1:
+        raise RuntimeError("expected pinned DINO processor loader not found")
+    if retrieval_source.count(dino_model_old) != 1:
+        raise RuntimeError("expected pinned DINO model loader not found")
+    retrieval_source = retrieval_source.replace(dino_processor_old, dino_processor_new, 1)
+    retrieval_source = retrieval_source.replace(dino_model_old, dino_model_new, 1)
+    retrieval_path.write_text(retrieval_source)
+
     log_path = target / "stage3.log"
     timing_path = target / "stage3_timing.json"
     command = [
