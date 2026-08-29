@@ -1093,7 +1093,7 @@ def worldgen_case000_stage4() -> dict:
     cameras_path = gs_data / "cameras.json"
     points_path = gs_data / "points.ply"
     sky_points_path = gs_data / "sky_points.ply"
-    if cameras_path.is_file() and points_path.is_file() and sky_points_path.is_file():
+    if cameras_path.is_file() and points_path.is_file():
         payload = json.loads(cameras_path.read_text())
         camera_count = len([key for key in payload if key not in {"width", "height"}])
         images = sorted((gs_data / "images").glob("*.png"))
@@ -1207,7 +1207,7 @@ def worldgen_case000_stage4() -> dict:
     if completed.returncode != 0:
         tail = log_path.read_text(errors="replace")[-30000:]
         raise RuntimeError(f"WorldGen Stage 4 failed with exit {completed.returncode}:\n{tail}")
-    if not cameras_path.is_file() or not points_path.is_file() or not sky_points_path.is_file():
+    if not cameras_path.is_file() or not points_path.is_file():
         raise RuntimeError("Stage 4 completed without required GS dataset files")
     if not camera_count or len(images) != camera_count or len(normals) != camera_count:
         raise RuntimeError(
