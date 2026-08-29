@@ -720,7 +720,6 @@ def preload_worldstereo_stage3_weights() -> dict:
     gpu=GPU,
     cpu=16.0,
     memory=131072,
-    ephemeral_disk=32768,
     volumes={"/models": model_cache, "/worldgen": worldgen_outputs},
     secrets=[hf_secret],
     timeout=4 * 60 * 60,
