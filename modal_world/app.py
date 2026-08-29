@@ -301,6 +301,68 @@ def worldgen_case000_stage1() -> dict:
         if old_mesh_cleanup not in panorama_source:
             raise RuntimeError("expected upstream Open3D mesh cleanup block not found")
         panorama_source = panorama_source.replace(old_mesh_cleanup, new_mesh_cleanup, 1)
+
+        mesh_assign_old = """    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices_np)
+    mesh.triangles = o3d.utility.Vector3iVector(faces_np)
+    if vertex_colors_np is not None:
+        mesh.vertex_colors = o3d.utility.Vector3dVector(vertex_colors_np)
+"""
+        mesh_assign_new = """    vertices_np = np.ascontiguousarray(vertices_np, dtype=np.float64)
+    faces_np = np.ascontiguousarray(faces_np, dtype=np.int32)
+    if vertex_colors_np is not None:
+        vertex_colors_np = np.ascontiguousarray(vertex_colors_np, dtype=np.float64)
+    if vertices_np.ndim != 2 or vertices_np.shape[1] != 3:
+        raise RuntimeError(f"invalid panorama mesh vertex shape: {vertices_np.shape}")
+    if not np.isfinite(vertices_np).all():
+        bad = np.argwhere(~np.isfinite(vertices_np))[:20]
+        raise RuntimeError(f"non-finite panorama mesh vertices before Open3D: {bad.tolist()}")
+    if faces_np.ndim != 2 or faces_np.shape[1] != 3:
+        raise RuntimeError(f"invalid panorama mesh face shape: {faces_np.shape}")
+    if faces_np.size and (faces_np.min() < 0 or faces_np.max() >= len(vertices_np)):
+        raise RuntimeError(
+            f"panorama mesh face index out of range: min={faces_np.min()} max={faces_np.max()} vertices={len(vertices_np)}"
+        )
+    print(
+        f"[modal-world] mesh precheck: vertices={vertices_np.shape} dtype={vertices_np.dtype} "
+        f"contiguous={vertices_np.flags.c_contiguous} min={vertices_np.min(axis=0).tolist()} "
+        f"max={vertices_np.max(axis=0).tolist()} faces={faces_np.shape} face_min={int(faces_np.min()) if faces_np.size else -1} "
+        f"face_max={int(faces_np.max()) if faces_np.size else -1}",
+        flush=True,
+    )
+    debug_dir = os.environ.get("MODAL_WORLD_MESH_DEBUG_DIR")
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        np.save(os.path.join(debug_dir, "vertices_head.npy"), vertices_np[:10000])
+        np.save(os.path.join(debug_dir, "faces_head.npy"), faces_np[:20000])
+        with open(os.path.join(debug_dir, "mesh_stats.json"), "w") as fh:
+            json.dump(
+                {
+                    "vertices_shape": list(vertices_np.shape),
+                    "vertices_dtype": str(vertices_np.dtype),
+                    "vertices_min": vertices_np.min(axis=0).tolist(),
+                    "vertices_max": vertices_np.max(axis=0).tolist(),
+                    "faces_shape": list(faces_np.shape),
+                    "faces_dtype": str(faces_np.dtype),
+                    "faces_min": int(faces_np.min()) if faces_np.size else None,
+                    "faces_max": int(faces_np.max()) if faces_np.size else None,
+                },
+                fh,
+                indent=2,
+            )
+    print("[modal-world] Open3D Vector3dVector begin", flush=True)
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices_np)
+    print("[modal-world] Open3D Vector3dVector ok", flush=True)
+    mesh.triangles = o3d.utility.Vector3iVector(faces_np)
+    print("[modal-world] Open3D Vector3iVector ok", flush=True)
+    if vertex_colors_np is not None:
+        mesh.vertex_colors = o3d.utility.Vector3dVector(vertex_colors_np)
+        print("[modal-world] Open3D vertex colors ok", flush=True)
+"""
+        if mesh_assign_old not in panorama_source:
+            raise RuntimeError("expected upstream Open3D mesh assignment block not found")
+        panorama_source = panorama_source.replace(mesh_assign_old, mesh_assign_new, 1)
         mesh_resolution_old = "mesh_h, mesh_w = 960, 1920"
         mesh_resolution_new = "mesh_h, mesh_w = 480, 960  # modal-world single-GPU WorldNav mesh"
         if (
@@ -341,6 +403,7 @@ def worldgen_case000_stage1() -> dict:
         env = os.environ.copy()
         env["PYTHONPATH"] = f"{worldgen_root}:{HYWORLD2_SOURCE}"
         env["PYTHONFAULTHANDLER"] = "1"
+        env["MODAL_WORLD_MESH_DEBUG_DIR"] = str(target / "mesh_debug")
         stage_started = time.perf_counter()
         with log_path.open("w") as log:
             completed = subprocess.run(
