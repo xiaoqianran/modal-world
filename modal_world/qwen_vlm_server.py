@@ -62,6 +62,7 @@ class Qwen3VLEngine:
 
         self.torch = torch
         self.model_id = model_id
+        self._generation_lock = threading.Lock()
         started = time.perf_counter()
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -100,7 +101,7 @@ class Qwen3VLEngine:
                     "top_p": float(body.get("top_p", 1.0)),
                 }
             )
-        with torch.inference_mode():
+        with self._generation_lock, torch.inference_mode():
             generated = self.model.generate(**inputs, **generate_kwargs)
         trimmed = [out[len(inp) :] for inp, out in zip(inputs.input_ids, generated)]
         text = self.processor.batch_decode(

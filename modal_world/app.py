@@ -499,3 +499,127 @@ def worldgen_case000_stage1() -> dict:
         "files": files,
         "stage1_log_tail": (target / "stage1.log").read_text(errors="replace")[-8000:],
     }
+
+
+@app.function(
+    image=hyworld2_worldgen_stage1_image,
+    gpu=GPU,
+    volumes={"/models": model_cache, "/worldgen": worldgen_outputs},
+    secrets=[hf_secret],
+    timeout=2 * 60 * 60,
+)
+def worldgen_case000_stage2() -> dict:
+    """Render Stage 1 trajectories and caption them with local Qwen3-VL."""
+    import json
+    import os
+    import subprocess
+    import sys
+    import time
+    import urllib.request
+    from pathlib import Path
+
+    os.environ["HF_HOME"] = "/models/huggingface"
+    os.environ["HUGGINGFACE_HUB_CACHE"] = "/models/huggingface/hub"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    import torch
+
+    sys.path.insert(0, HYWORLD2_SOURCE)
+    from modal_world.qwen_vlm_server import Qwen3VLEngine, start_openai_server
+
+    target = Path("/worldgen/case000")
+    if not (target / "camera_trajectory/target_camera.json").is_file():
+        raise RuntimeError("Stage 1 camera trajectory is missing")
+    if not (target / "render_results/global_pcd.ply").is_file():
+        raise RuntimeError("Stage 1 global point cloud is missing")
+
+    torch.cuda.reset_peak_memory_stats()
+    vlm_started = time.perf_counter()
+    engine = Qwen3VLEngine("Qwen/Qwen3-VL-8B-Instruct")
+    server, _thread = start_openai_server(engine, port=8000)
+    vlm_load_s = time.perf_counter() - vlm_started
+    model_cache.commit()
+
+    log_path = target / "stage2.log"
+    timing_path = target / "stage2_timing.json"
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8000/v1/models", timeout=5) as response:
+            if response.status != 200:
+                raise RuntimeError(f"local Qwen3-VL server unhealthy: {response.status}")
+
+        worldgen_root = Path(HYWORLD2_SOURCE) / "hyworld2/worldgen"
+        command = [
+            sys.executable,
+            "-X",
+            "faulthandler",
+            "-u",
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node=1",
+            "traj_render.py",
+            "--target_path",
+            str(target),
+            "--llm_addr",
+            "127.0.0.1",
+            "--llm_port",
+            "8000",
+            "--llm_name",
+            "Qwen/Qwen3-VL-8B-Instruct",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = f"{worldgen_root}:{HYWORLD2_SOURCE}"
+        env["PYTHONFAULTHANDLER"] = "1"
+        started = time.perf_counter()
+        with log_path.open("w") as log:
+            completed = subprocess.run(
+                command,
+                cwd=worldgen_root,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+                timeout=90 * 60,
+            )
+        stage2_s = time.perf_counter() - started
+        timing = {
+            "vlm_load_s": round(vlm_load_s, 3),
+            "stage2_s": round(stage2_s, 3),
+            "peak_allocated_gb": round(torch.cuda.max_memory_allocated() / 1024**3, 3),
+            "returncode": completed.returncode,
+        }
+        timing_path.write_text(json.dumps(timing, indent=2) + "\n")
+        worldgen_outputs.commit()
+        if completed.returncode != 0:
+            tail = log_path.read_text(errors="replace")[-24000:]
+            raise RuntimeError(f"WorldGen Stage 2 failed with exit {completed.returncode}:\n{tail}")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    renders = sorted(target.glob("render_results/*/traj*/render.mp4"))
+    masks = sorted(target.glob("render_results/*/traj*/render_mask.mp4"))
+    captions = sorted(target.glob("render_results/*/traj*/traj_caption.json"))
+    if not renders:
+        raise RuntimeError("Stage 2 completed without rendered trajectory videos")
+    if len(masks) != len(renders):
+        raise RuntimeError(f"Stage 2 render/mask count mismatch: {len(renders)} vs {len(masks)}")
+    if not captions:
+        raise RuntimeError("Stage 2 completed without trajectory captions")
+
+    worldgen_outputs.commit()
+    return {
+        "gpu": torch.cuda.get_device_name(),
+        "capability": list(torch.cuda.get_device_capability()),
+        "torch": str(torch.__version__),
+        "vlm_load_s": round(vlm_load_s, 3),
+        "stage2_s": round(stage2_s, 3),
+        "peak_allocated_gb": round(torch.cuda.max_memory_allocated() / 1024**3, 3),
+        "render_count": len(renders),
+        "mask_count": len(masks),
+        "caption_count": len(captions),
+        "render_bytes": sum(path.stat().st_size for path in renders),
+        "stage2_log_tail": log_path.read_text(errors="replace")[-8000:],
+    }
