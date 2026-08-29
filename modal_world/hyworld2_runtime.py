@@ -150,6 +150,7 @@ hyworld2_worldgen_stage1_image = (
         "onnx>=1.17,<2",
         "onnxruntime-gpu>=1.20,<2",
         "pycocotools>=2.0.8,<3",
+        "cupy-cuda12x==13.6.0",
     )
     .run_commands(
         "python -m pip install --no-deps 'git+https://github.com/EasternJournalist/utils3d.git@c5daf6f6c244d251f252102d09e9b7bcef791a38'",

@@ -234,6 +234,7 @@ def worldgen_case000_stage1() -> dict:
     engine = Qwen3VLEngine("Qwen/Qwen3-VL-8B-Instruct")
     server, _thread = start_openai_server(engine, port=8000)
     vlm_load_s = time.perf_counter() - vlm_started
+    model_cache.commit()
     try:
         with urllib.request.urlopen("http://127.0.0.1:8000/v1/models", timeout=5) as response:
             if response.status != 200:
@@ -273,6 +274,8 @@ def worldgen_case000_stage1() -> dict:
             )
         stage1_s = time.perf_counter() - stage_started
         if completed.returncode != 0:
+            model_cache.commit()
+            worldgen_outputs.commit()
             tail = log_path.read_text(errors="replace")[-12000:]
             raise RuntimeError(f"WorldGen Stage 1 failed with exit {completed.returncode}:\n{tail}")
     finally:
