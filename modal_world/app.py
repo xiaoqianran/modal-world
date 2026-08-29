@@ -269,6 +269,9 @@ def worldgen_case000_stage1() -> dict:
         log_path = target / "stage1.log"
         command = [
             sys.executable,
+            "-X",
+            "faulthandler",
+            "-u",
             "traj_generate.py",
             "--target_path",
             str(target),
@@ -285,6 +288,7 @@ def worldgen_case000_stage1() -> dict:
         ]
         env = os.environ.copy()
         env["PYTHONPATH"] = f"{worldgen_root}:{HYWORLD2_SOURCE}"
+        env["PYTHONFAULTHANDLER"] = "1"
         stage_started = time.perf_counter()
         with log_path.open("w") as log:
             completed = subprocess.run(
@@ -298,10 +302,19 @@ def worldgen_case000_stage1() -> dict:
                 timeout=90 * 60,
             )
         stage1_s = time.perf_counter() - stage_started
+        timing = {
+            "vlm_load_s": round(vlm_load_s, 3),
+            "stage1_s": round(stage1_s, 3),
+            "peak_allocated_gb": round(torch.cuda.max_memory_allocated() / 1024**3, 3),
+            "returncode": completed.returncode,
+        }
+        (target / "wrapper_timing.json").write_text(
+            __import__("json").dumps(timing, indent=2) + "\n"
+        )
         if completed.returncode != 0:
             model_cache.commit()
             worldgen_outputs.commit()
-            tail = log_path.read_text(errors="replace")[-12000:]
+            tail = log_path.read_text(errors="replace")[-20000:]
             raise RuntimeError(f"WorldGen Stage 1 failed with exit {completed.returncode}:\n{tail}")
     finally:
         server.shutdown()
