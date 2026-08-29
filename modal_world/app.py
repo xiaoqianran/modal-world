@@ -78,7 +78,7 @@ def hyworld2_artifact_smoke() -> dict:
     return {
         "gpu": torch.cuda.get_device_name(),
         "capability": list(torch.cuda.get_device_capability()),
-        "torch": torch.__version__,
+        "torch": str(torch.__version__),
         "gsplat": importlib.metadata.version("gsplat"),
         "pytorch3d": importlib.metadata.version("pytorch3d"),
         "fused_ssim": importlib.metadata.version("fused-ssim"),
