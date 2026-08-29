@@ -373,6 +373,33 @@ def worldgen_case000_stage1() -> dict:
         ):
             raise RuntimeError("expected upstream WorldNav mesh resolution not found")
         panorama_utils.write_text(panorama_source)
+
+        navi_utils_path = worldgen_root / "src/navi_utils.py"
+        navi_source = navi_utils_path.read_text()
+        old_rotation = """        R_to_yup = mesh.get_rotation_matrix_from_xyz((-np.pi / 2, 0, 0))
+        mesh.rotate(R_to_yup, center=(0, 0, 0))
+
+        verts = [(float(x), float(y), float(z)) for x, y, z in np.asarray(mesh.vertices)]
+        faces = [(int(a), int(b), int(c)) for a, b, c in np.asarray(mesh.triangles)]
+"""
+        new_rotation = """        # modal-world single-GPU profile: avoid Open3D 0.18 rotation helper segfault.
+        # Equivalent to get_rotation_matrix_from_xyz((-pi/2, 0, 0)).
+        R_to_yup = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]],
+            dtype=np.float64,
+        )
+        verts_np = np.asarray(mesh.vertices, dtype=np.float64).copy()
+        verts_np = np.ascontiguousarray(verts_np @ R_to_yup.T, dtype=np.float64)
+        mesh.vertices = o3d.utility.Vector3dVector(verts_np)
+        print(f"[modal-world] NumPy Z-up -> Y-up rotation ok: {verts_np.shape}", flush=True)
+
+        verts = [(float(x), float(y), float(z)) for x, y, z in verts_np]
+        faces = [(int(a), int(b), int(c)) for a, b, c in np.asarray(mesh.triangles)]
+"""
+        if old_rotation not in navi_source:
+            raise RuntimeError("expected upstream Open3D rotation block not found")
+        navi_utils_path.write_text(navi_source.replace(old_rotation, new_rotation, 1))
+
         traj_source = (worldgen_root / "traj_generate.py").read_text()
         if mesh_resolution_old not in traj_source:
             raise RuntimeError(
