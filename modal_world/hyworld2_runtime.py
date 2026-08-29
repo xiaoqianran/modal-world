@@ -29,6 +29,11 @@ HYWORLD2_ARTIFACT_BUNDLES: tuple[dict[str, Any], ...] = (
         "archive_sha256": "c294c84b2645a5105fe911e519927f016956c73058c5e8a97acea375a4ac94b6",
         "public_release": False,
     },
+    {
+        "tag": "hyworld2-flash-attn-py311-cu128-torch271-sm120-v1",
+        "archive_sha256": "7653177eb13c6056066f72cd27c1e3f540ada13d9d6dbf65e5657930e7522952",
+        "public_release": True,
+    },
 )
 
 artifacts_volume = modal.Volume.from_name(ARTIFACT_VOLUME_NAME, create_if_missing=False)

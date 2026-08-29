@@ -2,7 +2,7 @@ from modal_world.hyworld2_runtime import HYWORLD2_ARTIFACT_BUNDLES
 
 
 def test_runtime_bundles_are_content_addressed():
-    assert len(HYWORLD2_ARTIFACT_BUNDLES) == 3
+    assert len(HYWORLD2_ARTIFACT_BUNDLES) == 4
     for spec in HYWORLD2_ARTIFACT_BUNDLES:
         assert len(spec["archive_sha256"]) == 64
         int(spec["archive_sha256"], 16)
