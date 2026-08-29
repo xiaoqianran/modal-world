@@ -10,6 +10,7 @@ from .hyworld2_runtime import (
     hyworld2_artifact_image,
     hyworld2_worldgen_stage1_image,
     hyworld2_worldgen_stage3_image,
+    hyworld2_worldgen_stage5_image,
     hyworld2_worldmirror_image,
 )
 from .service import capabilities as local_capabilities
@@ -1221,3 +1222,109 @@ def worldgen_case000_stage4() -> dict:
         "sky_points_bytes": sky_points_path.stat().st_size,
         "stage4_log_tail": log_path.read_text(errors="replace")[-8000:],
     }
+
+
+@app.function(
+    image=hyworld2_worldgen_stage5_image,
+    cpu=8.0,
+    memory=32768,
+    volumes={"/models": model_cache, "/worldgen": worldgen_outputs},
+    timeout=45 * 60,
+)
+def preflight_worldgen_case000_stage5() -> dict:
+    """CPU-only Stage 5 preflight: cache LPIPS and parse the real GS dataset."""
+    import json
+    import os
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    os.environ["TORCH_HOME"] = "/models/torch"
+    os.environ["XDG_CACHE_HOME"] = "/models/cache"
+    os.environ["PYTHONPATH"] = f"{HYWORLD2_SOURCE}/hyworld2/worldgen:{HYWORLD2_SOURCE}"
+
+    data_dir = Path("/worldgen/case000/gs_data")
+    required = [
+        data_dir / "cameras.json",
+        data_dir / "points.ply",
+        data_dir / "meta_info.json",
+        data_dir / "images",
+        data_dir / "normals",
+    ]
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        raise RuntimeError(f"Stage 5 preflight missing GS data: {missing}")
+
+    started = time.perf_counter()
+    from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+    lpips_started = time.perf_counter()
+    metric = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False)
+    del metric
+    lpips_s = time.perf_counter() - lpips_started
+    model_cache.commit()
+
+    worldgen_root = Path(HYWORLD2_SOURCE) / "hyworld2/worldgen"
+    help_started = time.perf_counter()
+    completed = subprocess.run(
+        [sys.executable, "-m", "world_gs_trainer", "default", "--help"],
+        cwd=worldgen_root,
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    help_s = time.perf_counter() - help_started
+    if completed.returncode != 0:
+        raise RuntimeError(f"Stage 5 trainer CLI failed:\n{completed.stdout[-12000:]}")
+
+    sys.path.insert(0, str(worldgen_root))
+    from gs.opencv import Dataset, Parser
+
+    parser_started = time.perf_counter()
+    parser = Parser(
+        data_dir=str(data_dir),
+        factor=1,
+        normalize=True,
+        test_every=32,
+        downsample_pts_num=1_000_000,
+        downsample_mode="geometry_aware",
+        detect_anchor_candidates=False,
+        world_rank=0,
+        world_size=1,
+        local_rank=0,
+    )
+    parser_s = time.perf_counter() - parser_started
+    trainset = Dataset(
+        parser,
+        split="train",
+        load_depths=True,
+        load_normals=True,
+    )
+    valset = Dataset(parser, split="val")
+
+    depth_available = sum(path is not None for path in parser.depth_dict.values())
+    normal_available = sum(path is not None for path in parser.normal_dict.values())
+    vgg_cache = Path("/models/torch/hub/checkpoints/vgg16-397923af.pth")
+    report = {
+        "success": True,
+        "elapsed_s": round(time.perf_counter() - started, 3),
+        "lpips_cache_s": round(lpips_s, 3),
+        "trainer_help_s": round(help_s, 3),
+        "parser_s": round(parser_s, 3),
+        "image_count": len(parser.image_names),
+        "train_count": len(trainset),
+        "val_count": len(valset),
+        "initial_point_count": len(parser.points),
+        "sky_point_count": int(parser.sky_mask.sum()),
+        "depth_available": depth_available,
+        "normal_available": normal_available,
+        "vgg_cache_exists": vgg_cache.is_file(),
+        "vgg_cache_bytes": vgg_cache.stat().st_size if vgg_cache.is_file() else 0,
+    }
+    Path("/models/stage5_preflight.json").write_text(json.dumps(report, indent=2) + "\n")
+    model_cache.commit()
+    return report

@@ -32,3 +32,18 @@ def test_official_single_gpu_uses_documented_3dgs_steps(tmp_path: Path):
 
 def test_official_8gpu_uses_documented_3dgs_steps(tmp_path: Path):
     assert make_profile(tmp_path, nproc=8).max_steps == 1500
+
+
+def test_single_gpu_scales_strategy_steps_with_max_steps(tmp_path: Path):
+    profile = make_profile(tmp_path, nproc=1)
+    train = next(stage for stage in profile.commands() if stage.name == "gs_training")
+    argv = list(train.argv)
+
+    def value(flag: str) -> str:
+        return argv[argv.index(flag) + 1]
+
+    assert value("--max_steps") == "8000"
+    assert value("--strategy.refine-start-iter") == "800"
+    assert value("--strategy.refine-stop-iter") == "4000"
+    assert value("--strategy.refine-every") == "533"
+    assert value("--strategy.refine-scale2d-stop-iter") == "4000"

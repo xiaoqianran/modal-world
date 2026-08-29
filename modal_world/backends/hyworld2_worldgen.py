@@ -60,6 +60,16 @@ class OfficialWorldgenProfile:
         # Official README: x8=1500, x4=2000, x2=4000, x1=8000.
         return {1: 8000, 2: 4000, 4: 2000, 8: 1500}.get(nproc, 8000)
 
+    @staticmethod
+    def _scaled_strategy_steps(max_steps: int) -> tuple[int, int, int, int]:
+        """Scale upstream 1500-step strategy timings proportionally to max_steps."""
+        scale = max_steps / 1500.0
+        refine_start = max(1, round(150 * scale))
+        refine_stop = max(refine_start + 1, round(750 * scale))
+        refine_every = max(1, round(100 * scale))
+        scale2d_stop = max(refine_start + 1, round(750 * scale))
+        return refine_start, refine_stop, refine_every, scale2d_stop
+
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()
         if self.cuda_visible_devices:
@@ -81,6 +91,9 @@ class OfficialWorldgenProfile:
         target = str(self.target_path)
         env = self._env()
         steps = str(self.max_steps)
+        refine_start, refine_stop, refine_every, scale2d_stop = self._scaled_strategy_steps(
+            self.max_steps
+        )
         return (
             StageCommand(
                 "trajectory_planning",
@@ -155,13 +168,13 @@ class OfficialWorldgenProfile:
                     "--use_anchor_protection",
                     "--export_mesh",
                     "--strategy.refine-start-iter",
-                    "150",
+                    str(refine_start),
                     "--strategy.refine-stop-iter",
-                    "750",
+                    str(refine_stop),
                     "--strategy.refine-every",
-                    "100",
+                    str(refine_every),
                     "--strategy.refine-scale2d-stop-iter",
-                    "750",
+                    str(scale2d_stop),
                     "--strategy.reset-every",
                     "99990",
                     "--strategy.grow-grad2d",
