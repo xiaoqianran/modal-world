@@ -225,9 +225,13 @@ def worldgen_case000_stage1() -> dict:
 
     source_case = Path(HYWORLD2_SOURCE) / "examples/worldgen/case000"
     target = Path("/worldgen/case000")
-    if target.exists():
-        shutil.rmtree(target)
-    shutil.copytree(source_case, target)
+    if not target.exists():
+        shutil.copytree(source_case, target)
+    else:
+        source_panorama = source_case / "panorama.png"
+        target_panorama = target / "panorama.png"
+        if not target_panorama.exists():
+            shutil.copy2(source_panorama, target_panorama)
 
     torch.cuda.reset_peak_memory_stats()
     vlm_started = time.perf_counter()
@@ -264,7 +268,40 @@ def worldgen_case000_stage1() -> dict:
 """
         if old_camera_code not in panorama_source:
             raise RuntimeError("expected upstream get_panorama_cameras_v2 block not found")
-        panorama_utils.write_text(panorama_source.replace(old_camera_code, new_camera_code, 1))
+        panorama_source = panorama_source.replace(old_camera_code, new_camera_code, 1)
+
+        old_mesh_cleanup = """    mesh.remove_unreferenced_vertices()
+    mesh.remove_degenerate_triangles()
+
+    # ========== 6. Boundary handling. ==========
+    if connect_boundary_max_dist is not None and connect_boundary_max_dist > 0:
+        mesh = _fill_small_boundary_spikes(mesh, connect_boundary_max_dist, connect_boundary_repeat_times)
+        # Recompute normals after potential modification, if mesh still valid
+        if mesh.has_triangles() and mesh.has_vertices():
+            mesh.compute_vertex_normals()
+            mesh.compute_triangle_normals()  # Also computes triangle normals if vertex normals are computed
+
+    return mesh
+"""
+        new_mesh_cleanup = """    # modal-world single-GPU profile: faces come from a structured panorama grid.
+    # Open3D 0.18 native cleanup segfaults on the ~1.8M-vertex case000 mesh on Blackwell runtime.
+    # Preserve the structured vertices/faces and skip boundary repair; later WorldNav code only
+    # consumes vertices/triangles for rendering and navmesh construction.
+    if not np.isfinite(vertices_np).all():
+        raise RuntimeError("non-finite panorama mesh vertices")
+    if faces_np.size and (faces_np.min() < 0 or faces_np.max() >= len(vertices_np)):
+        raise RuntimeError("panorama mesh face index out of range")
+    print(
+        f"[modal-world] safe panorama mesh: vertices={len(vertices_np)} faces={len(faces_np)}; "
+        "skipping Open3D native cleanup/boundary repair",
+        flush=True,
+    )
+    return mesh
+"""
+        if old_mesh_cleanup not in panorama_source:
+            raise RuntimeError("expected upstream Open3D mesh cleanup block not found")
+        panorama_source = panorama_source.replace(old_mesh_cleanup, new_mesh_cleanup, 1)
+        panorama_utils.write_text(panorama_source)
 
         log_path = target / "stage1.log"
         command = [
