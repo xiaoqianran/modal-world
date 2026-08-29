@@ -164,20 +164,16 @@ hyworld2_worldgen_stage3_image = hyworld2_worldgen_stage1_image.apt_install(
     "imagesize==1.4.1",
 )
 
-hyworld2_worldgen_stage5_image = (
-    hyworld2_worldgen_stage3_image
-    .pip_install(
-        "tensorboard>=2.19,<3",
-        "torchmetrics==1.7.2",
-        "viser==0.2.23",
-        "tyro==1.0.8",
-        "PyYAML>=6,<7",
-        "splines>=0.3,<1",
-    )
-    .pip_install(
-        "numpy==1.26.4",
-        "plyfile==1.1.3",
-        "ml-dtypes==0.5.4",
-        "ninja>=1.11,<2",
-    )
+hyworld2_worldgen_stage5_image = hyworld2_worldgen_stage3_image.pip_install(
+    "tensorboard>=2.19,<3",
+    "torchmetrics==1.7.2",
+    "viser==0.2.23",
+    "tyro==1.0.8",
+    "PyYAML>=6,<7",
+    "splines>=0.3,<1",
+).pip_install(
+    "numpy==1.26.4",
+    "plyfile==1.1.3",
+    "ml-dtypes==0.5.4",
+    "ninja>=1.11,<2",
 )
