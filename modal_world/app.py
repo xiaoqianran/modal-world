@@ -1052,3 +1052,172 @@ def worldgen_case000_stage3() -> dict:
         "aligned_pcd_bytes": aligned_pcd.stat().st_size,
         "stage3_log_tail": log_path.read_text(errors="replace")[-8000:],
     }
+
+
+@app.function(
+    image=hyworld2_worldgen_stage1_image,
+    gpu=GPU,
+    cpu=8.0,
+    memory=32768,
+    volumes={"/models": model_cache, "/worldgen": worldgen_outputs},
+    secrets=[hf_secret],
+    timeout=60 * 60,
+)
+def worldgen_case000_stage4() -> dict:
+    """Prepare official HYWorld2 3DGS training data on one RTX PRO 6000."""
+    import json
+    import os
+    import subprocess
+    import sys
+    import threading
+    import time
+    from pathlib import Path
+
+    os.environ["HF_HOME"] = "/models/huggingface"
+    os.environ["HUGGINGFACE_HUB_CACHE"] = "/models/huggingface/hub"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    target = Path("/worldgen/case000")
+    generation_bank = target / "render_results/generation_bank_worldstereo-memory-dmd"
+    required_stage3 = [generation_bank / "global_pcd.ply", generation_bank / "aligned_pcd.ply"]
+    missing_stage3 = [
+        str(path.relative_to(target)) for path in required_stage3 if not path.is_file()
+    ]
+    if missing_stage3:
+        raise RuntimeError(f"Stage 3 incomplete: missing {missing_stage3}")
+
+    gs_data = target / "gs_data"
+    cameras_path = gs_data / "cameras.json"
+    points_path = gs_data / "points.ply"
+    sky_points_path = gs_data / "sky_points.ply"
+    if cameras_path.is_file() and points_path.is_file() and sky_points_path.is_file():
+        payload = json.loads(cameras_path.read_text())
+        camera_count = len([key for key in payload if key not in {"width", "height"}])
+        images = sorted((gs_data / "images").glob("*.png"))
+        depths = sorted((gs_data / "depths").glob("*.png"))
+        normals = sorted((gs_data / "normals").glob("*.png"))
+        if camera_count and len(images) == camera_count and len(normals) == camera_count:
+            return {
+                "resumed": True,
+                "stage4_s": 0.0,
+                "camera_count": camera_count,
+                "image_count": len(images),
+                "depth_count": len(depths),
+                "normal_count": len(normals),
+                "points_bytes": points_path.stat().st_size,
+                "sky_points_bytes": sky_points_path.stat().st_size,
+            }
+
+    worldgen_root = Path(HYWORLD2_SOURCE) / "hyworld2/worldgen"
+    script_path = worldgen_root / "gen_gs_data.py"
+    script_source = script_path.read_text()
+    moge_old = 'MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to(device)'
+    moge_new = (
+        'MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal", local_files_only=True).to(device)'
+    )
+    if script_source.count(moge_old) != 1:
+        raise RuntimeError("expected pinned Stage 4 MoGe loader not found")
+    script_path.write_text(script_source.replace(moge_old, moge_new, 1))
+
+    log_path = target / "stage4.log"
+    timing_path = target / "stage4_timing.json"
+    command = [
+        sys.executable,
+        "-X",
+        "faulthandler",
+        "-u",
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node=1",
+        "gen_gs_data.py",
+        "--root_path",
+        str(target),
+        "--save_normal",
+        "--split_sky",
+    ]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{worldgen_root}:{HYWORLD2_SOURCE}"
+    env["PYTHONFAULTHANDLER"] = "1"
+
+    stop_monitor = threading.Event()
+    gpu_peak_mib = 0
+
+    def monitor_gpu() -> None:
+        nonlocal gpu_peak_mib
+        while not stop_monitor.wait(1.0):
+            try:
+                raw = subprocess.check_output(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=memory.used",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    text=True,
+                    timeout=5,
+                ).splitlines()[0]
+                gpu_peak_mib = max(gpu_peak_mib, int(raw.strip()))
+            except (subprocess.SubprocessError, ValueError, IndexError):
+                pass
+
+    monitor = threading.Thread(target=monitor_gpu, daemon=True)
+    monitor.start()
+    started = time.perf_counter()
+    try:
+        with log_path.open("w") as log:
+            completed = subprocess.run(
+                command,
+                cwd=worldgen_root,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+                timeout=50 * 60,
+            )
+    finally:
+        stop_monitor.set()
+        monitor.join(timeout=5)
+
+    stage4_s = time.perf_counter() - started
+    camera_count = 0
+    if cameras_path.is_file():
+        payload = json.loads(cameras_path.read_text())
+        camera_count = len([key for key in payload if key not in {"width", "height"}])
+    images = sorted((gs_data / "images").glob("*.png"))
+    depths = sorted((gs_data / "depths").glob("*.png"))
+    normals = sorted((gs_data / "normals").glob("*.png"))
+    timing = {
+        "stage4_s": round(stage4_s, 3),
+        "gpu_peak_used_mib": gpu_peak_mib,
+        "returncode": completed.returncode,
+        "camera_count": camera_count,
+        "image_count": len(images),
+        "depth_count": len(depths),
+        "normal_count": len(normals),
+        "points_exists": points_path.is_file(),
+        "sky_points_exists": sky_points_path.is_file(),
+    }
+    timing_path.write_text(json.dumps(timing, indent=2) + "\n")
+    worldgen_outputs.commit()
+
+    if completed.returncode != 0:
+        tail = log_path.read_text(errors="replace")[-30000:]
+        raise RuntimeError(f"WorldGen Stage 4 failed with exit {completed.returncode}:\n{tail}")
+    if not cameras_path.is_file() or not points_path.is_file() or not sky_points_path.is_file():
+        raise RuntimeError("Stage 4 completed without required GS dataset files")
+    if not camera_count or len(images) != camera_count or len(normals) != camera_count:
+        raise RuntimeError(
+            f"Stage 4 dataset count mismatch: cameras={camera_count} images={len(images)} "
+            f"normals={len(normals)} depths={len(depths)}"
+        )
+
+    return {
+        **timing,
+        "points_bytes": points_path.stat().st_size,
+        "sky_points_bytes": sky_points_path.stat().st_size,
+        "stage4_log_tail": log_path.read_text(errors="replace")[-8000:],
+    }
