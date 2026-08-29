@@ -1,8 +1,6 @@
 name: HYWorld2 Runtime Smoke
 
 on:
-  push:
-    branches: [master]
   workflow_dispatch:
 
 permissions:

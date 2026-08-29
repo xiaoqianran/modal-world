@@ -156,3 +156,10 @@ hyworld2_worldgen_stage1_image = (
         "python -m pip install --no-deps 'git+https://github.com/EasternJournalist/utils3d.git@c5daf6f6c244d251f252102d09e9b7bcef791a38'",
     )
 )
+
+
+hyworld2_worldgen_stage3_image = hyworld2_worldgen_stage1_image.apt_install(
+    "build-essential", "ninja-build"
+).pip_install(
+    "imagesize==1.4.1",
+)

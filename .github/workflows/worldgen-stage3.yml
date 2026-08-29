@@ -1,0 +1,35 @@
+name: HYWorld2 WorldGen Stage 3
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_gpu:
+        description: "Run Stage 3 GPU inference after CPU preload"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  stage3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.11"
+      - name: Install project
+        run: uv sync --extra dev
+      - name: Unit tests
+        run: uv run pytest -q
+      - name: Preload WorldStereo and Wan weights on CPU
+        run: uv run modal run -m modal_world.app::preload_worldstereo_stage3_weights
+      - name: Run WorldStereo DMD on one RTX PRO 6000
+        if: ${{ inputs.run_gpu }}
+        run: uv run modal run -m modal_world.app::worldgen_case000_stage3
