@@ -331,13 +331,15 @@ def worldgen_case000_stage1() -> dict:
         f"face_max={int(faces_np.max()) if faces_np.size else -1}",
         flush=True,
     )
-    debug_dir = os.environ.get("MODAL_WORLD_MESH_DEBUG_DIR")
+    _os = __import__("os")
+    _json = __import__("json")
+    debug_dir = _os.environ.get("MODAL_WORLD_MESH_DEBUG_DIR")
     if debug_dir:
-        os.makedirs(debug_dir, exist_ok=True)
-        np.save(os.path.join(debug_dir, "vertices_head.npy"), vertices_np[:10000])
-        np.save(os.path.join(debug_dir, "faces_head.npy"), faces_np[:20000])
-        with open(os.path.join(debug_dir, "mesh_stats.json"), "w") as fh:
-            json.dump(
+        _os.makedirs(debug_dir, exist_ok=True)
+        np.save(_os.path.join(debug_dir, "vertices_head.npy"), vertices_np[:10000])
+        np.save(_os.path.join(debug_dir, "faces_head.npy"), faces_np[:20000])
+        with open(_os.path.join(debug_dir, "mesh_stats.json"), "w") as fh:
+            _json.dump(
                 {
                     "vertices_shape": list(vertices_np.shape),
                     "vertices_dtype": str(vertices_np.dtype),
