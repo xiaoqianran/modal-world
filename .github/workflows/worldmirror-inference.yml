@@ -1,0 +1,26 @@
+name: WorldMirror Office Inference
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.11"
+      - name: Install project
+        run: uv sync --extra dev
+      - name: Unit tests
+        run: uv run pytest -q
+      - name: Run real WorldMirror inference
+        run: uv run modal run -m modal_world.app::worldmirror_office_inference

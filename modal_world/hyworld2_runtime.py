@@ -96,3 +96,31 @@ hyworld2_artifact_image = (
         timeout=30 * 60,
     )
 )
+
+HYWORLD2_REVISION = "df9988efb87bfc0f4947eb3889411cf957478b06"
+HYWORLD2_SOURCE = "/opt/HY-World-2.0"
+
+hyworld2_worldmirror_image = (
+    hyworld2_artifact_image.pip_install(
+        "huggingface_hub>=0.36,<1",
+        "omegaconf>=2.3,<3",
+        "einops>=0.8,<1",
+        "safetensors>=0.5,<1",
+        "scipy==1.14.1",
+        "timm==1.0.11",
+        "opencv-python-headless==4.10.0.84",
+        "Pillow>=10,<12",
+        "imageio[ffmpeg]>=2.37,<3",
+        "trimesh>=4,<5",
+        "plyfile>=1,<2",
+        "pycolmap==3.10.0",
+        "matplotlib==3.10.3",
+        "tqdm>=4.66,<5",
+        "requests>=2.32,<3",
+    )
+    .run_commands(
+        f"git clone --filter=blob:none https://github.com/Tencent-Hunyuan/HY-World-2.0.git {HYWORLD2_SOURCE}",
+        f"cd {HYWORLD2_SOURCE} && git checkout --detach {HYWORLD2_REVISION}",
+    )
+    .env({"PYTHONPATH": HYWORLD2_SOURCE})
+)
