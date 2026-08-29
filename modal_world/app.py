@@ -241,6 +241,31 @@ def worldgen_case000_stage1() -> dict:
                 raise RuntimeError(f"local Qwen3-VL server unhealthy: {response.status}")
 
         worldgen_root = Path(HYWORLD2_SOURCE) / "hyworld2/worldgen"
+        panorama_utils = worldgen_root / "src/panorama_utils.py"
+        panorama_source = panorama_utils.read_text()
+        old_camera_code = """def get_panorama_cameras_v2(subdivisions=0):
+    vertices = subdivide_icosahedron(subdivisions=subdivisions)
+    intrinsics = utils3d.numpy.intrinsics_from_fov(fov_x=np.deg2rad(90), fov_y=np.deg2rad(90))
+    extrinsics = utils3d.numpy.extrinsics_look_at([0, 0, 0], vertices, [0, 0, 1]).astype(np.float32)
+    return extrinsics, [intrinsics] * len(vertices)
+"""
+        new_camera_code = """def get_panorama_cameras_v2(subdivisions=0):
+    vertices = subdivide_icosahedron(subdivisions=subdivisions)
+    intrinsics = utils3d.numpy.intrinsics_from_fov(fov_x=np.deg2rad(90), fov_y=np.deg2rad(90))
+    eye = np.zeros_like(vertices, dtype=np.float32)
+    up = np.broadcast_to(np.array([0, 0, 1], dtype=np.float32), vertices.shape).copy()
+    view = vertices / np.linalg.norm(vertices, axis=-1, keepdims=True)
+    pole_mask = np.abs(view[:, 2]) > 0.999
+    up[pole_mask] = np.array([0, 1, 0], dtype=np.float32)
+    extrinsics = utils3d.numpy.extrinsics_look_at(eye, vertices, up).astype(np.float32)
+    if not np.isfinite(extrinsics).all():
+        raise RuntimeError("non-finite panorama camera extrinsics after pole-safe up selection")
+    return extrinsics, [intrinsics] * len(vertices)
+"""
+        if old_camera_code not in panorama_source:
+            raise RuntimeError("expected upstream get_panorama_cameras_v2 block not found")
+        panorama_utils.write_text(panorama_source.replace(old_camera_code, new_camera_code, 1))
+
         log_path = target / "stage1.log"
         command = [
             sys.executable,
