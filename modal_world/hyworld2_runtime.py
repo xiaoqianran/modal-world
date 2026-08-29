@@ -174,5 +174,10 @@ hyworld2_worldgen_stage5_image = (
         "PyYAML>=6,<7",
         "splines>=0.3,<1",
     )
-    .pip_install("numpy==1.26.4")
+    .pip_install(
+        "numpy==1.26.4",
+        "plyfile==1.1.3",
+        "ml-dtypes==0.5.1",
+        "ninja>=1.11,<2",
+    )
 )
