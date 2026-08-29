@@ -177,7 +177,7 @@ hyworld2_worldgen_stage5_image = (
     .pip_install(
         "numpy==1.26.4",
         "plyfile==1.1.3",
-        "ml-dtypes==0.5.1",
+        "ml-dtypes==0.5.4",
         "ninja>=1.11,<2",
     )
 )
