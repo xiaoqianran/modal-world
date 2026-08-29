@@ -129,3 +129,29 @@ hyworld2_worldmirror_image = (
     )
     .env({"PYTHONPATH": HYWORLD2_SOURCE})
 )
+
+hyworld2_worldgen_stage1_image = (
+    hyworld2_worldmirror_image.apt_install("ffmpeg", "libgomp1")
+    .pip_install(
+        "transformers==5.2.0",
+        "accelerate>=1.10,<2",
+        "peft==0.18.1",
+        "diffusers==0.36.0",
+        "openai>=1.55,<3",
+        "kornia>=0.8,<1",
+        "easydict>=1.13,<2",
+        "scikit-image==0.25.2",
+        "open3d==0.18.0",
+        "loguru==0.7.3",
+        "decord>=0.6,<1",
+        "ftfy>=6.3,<7",
+        "regex>=2024.11",
+        "zim_anything==0.1",
+        "onnx>=1.17,<2",
+        "onnxruntime-gpu>=1.20,<2",
+        "pycocotools>=2.0.8,<3",
+    )
+    .run_commands(
+        "python -m pip install --no-deps 'git+https://github.com/EasternJournalist/utils3d.git@c5daf6f6c244d251f252102d09e9b7bcef791a38'",
+    )
+)
