@@ -1,0 +1,26 @@
+name: HYWorld2 Runtime Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.11"
+      - name: Install project and Modal CLI
+        run: uv sync --extra dev
+      - name: Unit tests
+        run: uv run pytest -q
+      - name: RTX PRO 6000 artifact smoke
+        run: uv run modal run -m modal_world.app::hyworld2_artifact_smoke

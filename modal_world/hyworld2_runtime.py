@@ -1,0 +1,98 @@
+from __future__ import annotations
+
+from typing import Any
+
+import modal
+
+ARTIFACT_VOLUME_NAME = "modal-build-artifacts"
+GPU = "RTX-PRO-6000"
+PYTHON = "3.11"
+CUDA = "12.8.1"
+TORCH = "2.7.1"
+TORCHVISION = "0.22.1"
+
+# Exact bundle hashes are produced and smoke-tested by xiaoqianran/modal-build.
+# They are kwargs to Image.run_function, so changing a hash invalidates Modal's image cache.
+HYWORLD2_ARTIFACT_BUNDLES: tuple[dict[str, Any], ...] = (
+    {
+        "tag": "hyworld2-hy-native-py311-cu128-torch271-sm120-v1",
+        "archive_sha256": "094e611679e02135e7f4e746d63554145d960aa52c3392ab5db8e1a6bc69f87a",
+        "public_release": False,
+    },
+    {
+        "tag": "hyworld2-oss-native-py311-cu128-torch271-sm120-v1",
+        "archive_sha256": "2c6b787925dbbbd7df389d77d548db2639f18113705686586bf85ca63902a746",
+        "public_release": True,
+    },
+    {
+        "tag": "hyworld2-oss-source-py311-v1",
+        "archive_sha256": "c294c84b2645a5105fe911e519927f016956c73058c5e8a97acea375a4ac94b6",
+        "public_release": False,
+    },
+)
+
+artifacts_volume = modal.Volume.from_name(ARTIFACT_VOLUME_NAME, create_if_missing=False)
+
+
+def install_artifact_bundles(bundles: tuple[dict[str, Any], ...]) -> None:
+    """Install prebuilt HYWorld2 wheels from modal-build into a captured Image layer."""
+    import hashlib
+    import json
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    import zipfile
+    from pathlib import Path
+
+    root = Path("/build-artifacts")
+    for spec in bundles:
+        tag = str(spec["tag"])
+        archive = root / f"{tag}.wheels.zip"
+        manifest_path = root / f"{tag}.manifest.json"
+        if not archive.is_file() or not manifest_path.is_file():
+            raise RuntimeError(f"modal-build artifact missing for {tag}")
+
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if digest != spec["archive_sha256"]:
+            raise RuntimeError(f"archive checksum mismatch for {tag}: {digest}")
+
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("tag") != tag:
+            raise RuntimeError(f"manifest tag mismatch for {tag}")
+        if manifest.get("archive_sha256") != digest:
+            raise RuntimeError(f"manifest archive checksum mismatch for {tag}")
+        if bool(manifest.get("public_release")) != bool(spec["public_release"]):
+            raise RuntimeError(f"manifest distribution policy mismatch for {tag}")
+
+        with tempfile.TemporaryDirectory(prefix=f"{tag}-") as temp:
+            temp_path = Path(temp)
+            with zipfile.ZipFile(archive) as zf:
+                zf.extractall(temp_path)
+            wheels = sorted((temp_path / "wheels").glob("*.whl"))
+            if not wheels:
+                raise RuntimeError(f"no wheels found in {tag}")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--no-deps", *map(str, wheels)],
+                check=True,
+            )
+
+    # Avoid capturing extracted temporary build state.
+    shutil.rmtree("/root/.cache/pip", ignore_errors=True)
+
+
+hyworld2_artifact_image = (
+    modal.Image.from_registry(f"nvidia/cuda:{CUDA}-runtime-ubuntu22.04", add_python=PYTHON)
+    .apt_install("git", "libgl1", "libglib2.0-0")
+    .run_commands(
+        "python -m pip install --upgrade pip setuptools wheel",
+        f"python -m pip install torch=={TORCH} torchvision=={TORCHVISION} --index-url https://download.pytorch.org/whl/cu128",
+        "python -m pip install numpy==1.26.4 'rich>=12,<14' 'jaxtyping>=0.2,<0.3'",
+    )
+    .run_function(
+        install_artifact_bundles,
+        volumes={"/build-artifacts": artifacts_volume},
+        kwargs={"bundles": HYWORLD2_ARTIFACT_BUNDLES},
+        timeout=30 * 60,
+    )
+)
