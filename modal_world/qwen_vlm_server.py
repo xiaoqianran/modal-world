@@ -26,7 +26,12 @@ def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for message in messages:
         content = message.get("content", "")
         if not isinstance(content, list):
-            normalized.append({"role": message.get("role", "user"), "content": content})
+            normalized.append(
+                {
+                    "role": message.get("role", "user"),
+                    "content": [{"type": "text", "text": str(content)}],
+                }
+            )
             continue
         items = []
         for item in content:
