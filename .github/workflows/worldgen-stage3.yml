@@ -1,35 +1,95 @@
 name: HYWorld2 WorldGen Stage 3
-
 on:
   workflow_dispatch:
-    inputs:
-      run_gpu:
-        description: "Run Stage 3 GPU inference after CPU preload"
-        required: true
-        default: false
-        type: boolean
-
 permissions:
   contents: read
-
 jobs:
   stage3:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 240
     env:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          repository: xiaoqianran/modal-provider
+          ref: main
+          path: provider
       - uses: astral-sh/setup-uv@v10.0.1
         with:
           python-version: "3.11"
-      - name: Install project
-        run: uv sync --extra dev
-      - name: Unit tests
-        run: uv run pytest -q
-      - name: Preload WorldStereo and Wan weights on CPU
-        run: uv run modal run -m modal_world.app::preload_worldstereo_stage3_weights
-      - name: Run WorldStereo DMD on one RTX PRO 6000
-        if: ${{ inputs.run_gpu }}
-        run: uv run modal run -m modal_world.app::worldgen_case000_stage3
+      - name: Show canonical commit
+        run: git -C provider log -1 --oneline
+      - name: Preload hidden WorldNav assets
+        working-directory: provider/modal-world
+        run: |
+          set -euo pipefail
+          uvx --from modal modal run -m modal_world.app::preload_worldnav_stage1_weights
+      - name: Isolate shared-Qwen worker
+        working-directory: provider/modal-world
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path("modal_world/stage2_app.py")
+          s=p.read_text()
+          old='app = modal.App("modal-world-stage2")'
+          new='app = modal.App("modal-world-stage12-rtree")'
+          if old not in s:
+              raise SystemExit("Stage2 app-name marker not found")
+          p.write_text(s.replace(old,new,1))
+          PY
+      - name: Deploy isolated shared-Qwen worker
+        working-directory: provider/modal-world
+        run: uvx --from modal modal deploy -m modal_world.stage2_app
+      - name: Prepare fresh panorama-only job
+        run: |
+          set -euo pipefail
+          VOL=hyworld2-worldgen-output
+          JOB=jobs/stage12-rtree
+          uvx --from modal modal volume rm -r "$VOL" "$JOB" || true
+          uvx --from modal modal volume cp "$VOL" case000/panorama.png "$JOB/panorama.png"
+      - name: Run and assert Stage1 then Stage2 on same worker
+        working-directory: provider/modal-world
+        run: |
+          set -euo pipefail
+          uv run --with modal --no-project python - <<'PY' | tee stage12-result.json
+          import json, math, time, modal
+          cls=modal.Cls.from_name("modal-world-stage12-rtree","WorldNavRenderer")
+          worker=cls()
+          t0=time.perf_counter()
+          stage1=worker.generate_nav.remote(job_id="stage12-rtree",force=True)
+          t1=time.perf_counter()
+          stage2=worker.render.remote(job_id="stage12-rtree",force=True)
+          t2=time.perf_counter()
+          if stage1.get("worker_call_index") != 0:
+              raise RuntimeError(f"Stage1 expected worker_call_index=0, got {stage1.get('worker_call_index')}")
+          if stage2.get("worker_call_index") != 1:
+              raise RuntimeError(f"Stage2 expected worker_call_index=1, got {stage2.get('worker_call_index')}")
+          if not math.isclose(stage1.get("model_load_s", -1), stage2.get("model_load_s", -2), rel_tol=0, abs_tol=1e-3):
+              raise RuntimeError(f"Qwen load mismatch: {stage1.get('model_load_s')} vs {stage2.get('model_load_s')}")
+          log=stage1.get("stage1_log_tail","")
+          for bad in ("Navmesh Error", "No module named 'rtree'"):
+              if bad in log:
+                  raise RuntimeError(f"Stage1 navmesh regression found in log: {bad}")
+          out={
+            "stage1_wall_s":round(t1-t0,3),
+            "stage2_wall_s":round(t2-t1,3),
+            "combined_wall_s":round(t2-t0,3),
+            "stage1":stage1,
+            "stage2":stage2,
+          }
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Assert navmesh reconstruction artifact exists
+        run: |
+          set -euo pipefail
+          uvx --from modal modal volume get hyworld2-worldgen-output jobs/stage12-rtree/navmesh/reconstruct_pairs.json /tmp/reconstruct_pairs.json --force
+          test -s /tmp/reconstruct_pairs.json
+          jq 'length' /tmp/reconstruct_pairs.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stage12-rtree-verify
+          path: provider/modal-world/stage12-result.json
+          if-no-files-found: warn
