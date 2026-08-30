@@ -115,4 +115,4 @@ For a short final-chain validation, use `worldgen_case000_stage5_smoke`; it perf
 
 ## Repository ownership
 
-The canonical source now belongs in `modal-provider/modal-world`. The standalone `modal-world` repository may remain as an independently runnable/syncable package, but monorepo integration is the source of truth going forward.
+`modal-provider/modal-world` is the sole source of truth. Do not sync changes back to the former standalone repository.

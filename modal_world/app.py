@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
+
 import modal
 
 from .hyworld2_runtime import (
     GPU,
+    HYWORLD2_REVISION,
     HYWORLD2_SOURCE,
     hyworld2_artifact_image,
     hyworld2_worldgen_stage1_image,
@@ -14,6 +17,14 @@ from .hyworld2_runtime import (
     hyworld2_worldmirror_image,
 )
 from .service import capabilities as local_capabilities
+from .worldgen_job import (
+    build_stage_manifest,
+    fingerprint_files,
+    manifest_matches,
+    resolve_worldgen_job_root,
+    stage_manifest_path,
+    write_stage_manifest,
+)
 
 app = modal.App("modal-world")
 
@@ -98,6 +109,9 @@ def hyworld2_artifact_smoke() -> dict:
 
 
 model_cache = modal.Volume.from_name("hyworld2-models", create_if_missing=True)
+runtime_cache = modal.Volume.from_name(
+    "hyworld2-runtime-cache-v2", create_if_missing=True, version=2
+)
 inference_outputs = modal.Volume.from_name("hyworld2-inference-output", create_if_missing=True)
 
 
@@ -195,454 +209,165 @@ def worldmirror_office_inference() -> dict:
 
 
 worldgen_outputs = modal.Volume.from_name("hyworld2-worldgen-output", create_if_missing=True)
-hf_secret = modal.Secret.from_name("hyworld2-hf")
+hf_secret = modal.Secret.from_name(os.environ.get("MODAL_WORLD_HF_SECRET", "hyworld2-hf"))
+
+
+def _spawn_worker_call(method, *, job_id: str, wait_timeout_s: float) -> dict:
+    """Spawn a deployed worker call with a hard timeout and cost-safe cancellation."""
+    call = method.spawn(job_id=job_id, force=False)
+    try:
+        result = call.get(timeout=wait_timeout_s)
+    except TimeoutError as exc:
+        try:
+            call.cancel(terminate_containers=True)
+        finally:
+            raise TimeoutError(
+                f"worker call timed out after {wait_timeout_s}s and was cancelled: {call.object_id}"
+            ) from exc
+    if isinstance(result, dict):
+        return {**result, "function_call_id": call.object_id}
+    return {"result": result, "function_call_id": call.object_id}
+
+
+@app.function(image=base_image, timeout=2 * 60 * 60)
+def worldgen_case000_stage1(job_id: str = "case000") -> dict:
+    """Dispatch Stage 1 to the persistent WorldNav/Qwen worker."""
+    worker_cls = modal.Cls.from_name("modal-world-stage2", "WorldNavRenderer")
+    return _spawn_worker_call(worker_cls().generate_nav, job_id=job_id, wait_timeout_s=30 * 60)
 
 
 @app.function(
     image=hyworld2_worldgen_stage1_image,
-    gpu=GPU,
-    volumes={"/models": model_cache, "/worldgen": worldgen_outputs},
+    cpu=4.0,
+    memory=16384,
+    volumes={"/models": model_cache},
     secrets=[hf_secret],
-    timeout=2 * 60 * 60,
+    timeout=60 * 60,
 )
-def worldgen_case000_stage1() -> dict:
-    """Run official HYWorld2 WorldNav Stage 1 on the official case000 panorama."""
+def preload_worldnav_stage1_weights() -> dict:
+    """Populate hidden Stage1 HF assets so WorldNav can run fully offline."""
     import os
-    import shutil
-    import subprocess
-    import sys
     import time
-    import urllib.request
     from pathlib import Path
 
     os.environ["HF_HOME"] = "/models/huggingface"
     os.environ["HUGGINGFACE_HUB_CACHE"] = "/models/huggingface/hub"
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
 
-    import torch
+    from huggingface_hub import snapshot_download
 
-    sys.path.insert(0, HYWORLD2_SOURCE)
-    from modal_world.qwen_vlm_server import Qwen3VLEngine, start_openai_server
-
-    source_case = Path(HYWORLD2_SOURCE) / "examples/worldgen/case000"
-    target = Path("/worldgen/case000")
-    if not target.exists():
-        shutil.copytree(source_case, target)
-    else:
-        source_panorama = source_case / "panorama.png"
-        target_panorama = target / "panorama.png"
-        if not target_panorama.exists():
-            shutil.copy2(source_panorama, target_panorama)
-
-    torch.cuda.reset_peak_memory_stats()
-    vlm_started = time.perf_counter()
-    engine = Qwen3VLEngine("Qwen/Qwen3-VL-8B-Instruct")
-    server, _thread = start_openai_server(engine, port=8000)
-    vlm_load_s = time.perf_counter() - vlm_started
-    model_cache.commit()
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:8000/v1/models", timeout=5) as response:
-            if response.status != 200:
-                raise RuntimeError(f"local Qwen3-VL server unhealthy: {response.status}")
-
-        worldgen_root = Path(HYWORLD2_SOURCE) / "hyworld2/worldgen"
-        panorama_utils = worldgen_root / "src/panorama_utils.py"
-        panorama_source = panorama_utils.read_text()
-        old_camera_code = """def get_panorama_cameras_v2(subdivisions=0):
-    vertices = subdivide_icosahedron(subdivisions=subdivisions)
-    intrinsics = utils3d.numpy.intrinsics_from_fov(fov_x=np.deg2rad(90), fov_y=np.deg2rad(90))
-    extrinsics = utils3d.numpy.extrinsics_look_at([0, 0, 0], vertices, [0, 0, 1]).astype(np.float32)
-    return extrinsics, [intrinsics] * len(vertices)
-"""
-        new_camera_code = """def get_panorama_cameras_v2(subdivisions=0):
-    vertices = subdivide_icosahedron(subdivisions=subdivisions)
-    intrinsics = utils3d.numpy.intrinsics_from_fov(fov_x=np.deg2rad(90), fov_y=np.deg2rad(90))
-    eye = np.zeros_like(vertices, dtype=np.float32)
-    up = np.broadcast_to(np.array([0, 0, 1], dtype=np.float32), vertices.shape).copy()
-    view = vertices / np.linalg.norm(vertices, axis=-1, keepdims=True)
-    pole_mask = np.abs(view[:, 2]) > 0.999
-    up[pole_mask] = np.array([0, 1, 0], dtype=np.float32)
-    extrinsics = utils3d.numpy.extrinsics_look_at(eye, vertices, up).astype(np.float32)
-    if not np.isfinite(extrinsics).all():
-        raise RuntimeError("non-finite panorama camera extrinsics after pole-safe up selection")
-    return extrinsics, [intrinsics] * len(vertices)
-"""
-        if old_camera_code not in panorama_source:
-            raise RuntimeError("expected upstream get_panorama_cameras_v2 block not found")
-        panorama_source = panorama_source.replace(old_camera_code, new_camera_code, 1)
-
-        old_mesh_cleanup = """    mesh.remove_unreferenced_vertices()
-    mesh.remove_degenerate_triangles()
-
-    # ========== 6. Boundary handling. ==========
-    if connect_boundary_max_dist is not None and connect_boundary_max_dist > 0:
-        mesh = _fill_small_boundary_spikes(mesh, connect_boundary_max_dist, connect_boundary_repeat_times)
-        # Recompute normals after potential modification, if mesh still valid
-        if mesh.has_triangles() and mesh.has_vertices():
-            mesh.compute_vertex_normals()
-            mesh.compute_triangle_normals()  # Also computes triangle normals if vertex normals are computed
-
-    return mesh
-"""
-        new_mesh_cleanup = """    # modal-world single-GPU profile: faces come from a structured panorama grid.
-    # Open3D 0.18 native cleanup segfaults on the ~1.8M-vertex case000 mesh on Blackwell runtime.
-    # Preserve the structured vertices/faces and skip boundary repair; later WorldNav code only
-    # consumes vertices/triangles for rendering and navmesh construction.
-    if not np.isfinite(vertices_np).all():
-        raise RuntimeError("non-finite panorama mesh vertices")
-    if faces_np.size and (faces_np.min() < 0 or faces_np.max() >= len(vertices_np)):
-        raise RuntimeError("panorama mesh face index out of range")
-    print(
-        f"[modal-world] safe panorama mesh: vertices={len(vertices_np)} faces={len(faces_np)}; "
-        "skipping Open3D native cleanup/boundary repair",
-        flush=True,
-    )
-    return mesh
-"""
-        if old_mesh_cleanup not in panorama_source:
-            raise RuntimeError("expected upstream Open3D mesh cleanup block not found")
-        panorama_source = panorama_source.replace(old_mesh_cleanup, new_mesh_cleanup, 1)
-
-        mesh_assign_old = """    mesh = o3d.geometry.TriangleMesh()
-    mesh.vertices = o3d.utility.Vector3dVector(vertices_np)
-    mesh.triangles = o3d.utility.Vector3iVector(faces_np)
-    mesh.vertex_colors = o3d.utility.Vector3dVector(colors_np)
-"""
-        mesh_assign_new = """    vertices_np = np.ascontiguousarray(vertices_np, dtype=np.float64)
-    faces_np = np.ascontiguousarray(faces_np, dtype=np.int32)
-    colors_np = np.ascontiguousarray(colors_np, dtype=np.float64)
-    if vertices_np.ndim != 2 or vertices_np.shape[1] != 3:
-        raise RuntimeError(f"invalid panorama mesh vertex shape: {vertices_np.shape}")
-    if not np.isfinite(vertices_np).all():
-        bad = np.argwhere(~np.isfinite(vertices_np))[:20]
-        raise RuntimeError(f"non-finite panorama mesh vertices before Open3D: {bad.tolist()}")
-    if faces_np.ndim != 2 or faces_np.shape[1] != 3:
-        raise RuntimeError(f"invalid panorama mesh face shape: {faces_np.shape}")
-    if faces_np.size and (faces_np.min() < 0 or faces_np.max() >= len(vertices_np)):
-        raise RuntimeError(
-            f"panorama mesh face index out of range: min={faces_np.min()} max={faces_np.max()} vertices={len(vertices_np)}"
-        )
-    if colors_np.shape != vertices_np.shape:
-        raise RuntimeError(f"panorama mesh color shape mismatch: {colors_np.shape} vs {vertices_np.shape}")
-    print(
-        f"[modal-world] mesh precheck: vertices={vertices_np.shape} dtype={vertices_np.dtype} "
-        f"contiguous={vertices_np.flags.c_contiguous} min={vertices_np.min(axis=0).tolist()} "
-        f"max={vertices_np.max(axis=0).tolist()} faces={faces_np.shape} "
-        f"face_min={int(faces_np.min()) if faces_np.size else -1} "
-        f"face_max={int(faces_np.max()) if faces_np.size else -1}",
-        flush=True,
-    )
-    _os = __import__("os")
-    _json = __import__("json")
-    debug_dir = _os.environ.get("MODAL_WORLD_MESH_DEBUG_DIR")
-    if debug_dir:
-        _os.makedirs(debug_dir, exist_ok=True)
-        np.save(_os.path.join(debug_dir, "vertices_head.npy"), vertices_np[:10000])
-        np.save(_os.path.join(debug_dir, "faces_head.npy"), faces_np[:20000])
-        with open(_os.path.join(debug_dir, "mesh_stats.json"), "w") as fh:
-            _json.dump(
-                {
-                    "vertices_shape": list(vertices_np.shape),
-                    "vertices_dtype": str(vertices_np.dtype),
-                    "vertices_min": vertices_np.min(axis=0).tolist(),
-                    "vertices_max": vertices_np.max(axis=0).tolist(),
-                    "faces_shape": list(faces_np.shape),
-                    "faces_dtype": str(faces_np.dtype),
-                    "faces_min": int(faces_np.min()) if faces_np.size else None,
-                    "faces_max": int(faces_np.max()) if faces_np.size else None,
-                },
-                fh,
-                indent=2,
-            )
-    print("[modal-world] Open3D Vector3dVector begin", flush=True)
-    mesh = o3d.geometry.TriangleMesh()
-    mesh.vertices = o3d.utility.Vector3dVector(vertices_np)
-    print("[modal-world] Open3D Vector3dVector ok", flush=True)
-    mesh.triangles = o3d.utility.Vector3iVector(faces_np)
-    print("[modal-world] Open3D Vector3iVector ok", flush=True)
-    mesh.vertex_colors = o3d.utility.Vector3dVector(colors_np)
-    print("[modal-world] Open3D vertex colors ok", flush=True)
-"""
-        if mesh_assign_old not in panorama_source:
-            raise RuntimeError("expected upstream Open3D mesh assignment block not found")
-        panorama_source = panorama_source.replace(mesh_assign_old, mesh_assign_new, 1)
-        mesh_resolution_old = "mesh_h, mesh_w = 960, 1920"
-        mesh_resolution_new = "mesh_h, mesh_w = 480, 960  # modal-world single-GPU WorldNav mesh"
-        if (
-            mesh_resolution_old not in panorama_source
-            and mesh_resolution_old not in (worldgen_root / "traj_generate.py").read_text()
-        ):
-            raise RuntimeError("expected upstream WorldNav mesh resolution not found")
-        panorama_utils.write_text(panorama_source)
-
-        navi_utils_path = worldgen_root / "src/navi_utils.py"
-        navi_source = navi_utils_path.read_text()
-        old_rotation = """        R_to_yup = mesh.get_rotation_matrix_from_xyz((-np.pi / 2, 0, 0))
-        mesh.rotate(R_to_yup, center=(0, 0, 0))
-
-        verts = [(float(x), float(y), float(z)) for x, y, z in np.asarray(mesh.vertices)]
-        faces = [(int(a), int(b), int(c)) for a, b, c in np.asarray(mesh.triangles)]
-"""
-        new_rotation = """        # modal-world single-GPU profile: avoid Open3D 0.18 rotation helper segfault.
-        # Equivalent to get_rotation_matrix_from_xyz((-pi/2, 0, 0)).
-        R_to_yup = np.array(
-            [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]],
-            dtype=np.float64,
-        )
-        verts_np = np.asarray(mesh.vertices, dtype=np.float64).copy()
-        verts_np = np.ascontiguousarray(verts_np @ R_to_yup.T, dtype=np.float64)
-        mesh.vertices = o3d.utility.Vector3dVector(verts_np)
-        print(f"[modal-world] NumPy Z-up -> Y-up rotation ok: {verts_np.shape}", flush=True)
-
-        verts = [(float(x), float(y), float(z)) for x, y, z in verts_np]
-        faces = [(int(a), int(b), int(c)) for a, b, c in np.asarray(mesh.triangles)]
-"""
-        if old_rotation not in navi_source:
-            raise RuntimeError("expected upstream Open3D rotation block not found")
-        navi_utils_path.write_text(navi_source.replace(old_rotation, new_rotation, 1))
-
-        traj_source = (worldgen_root / "traj_generate.py").read_text()
-        if mesh_resolution_old not in traj_source:
-            raise RuntimeError(
-                "expected upstream WorldNav mesh resolution not found in traj_generate.py"
-            )
-        (worldgen_root / "traj_generate.py").write_text(
-            traj_source.replace(mesh_resolution_old, mesh_resolution_new, 1)
-        )
-
-        log_path = target / "stage1.log"
-        command = [
-            sys.executable,
-            "-X",
-            "faulthandler",
-            "-u",
-            "traj_generate.py",
-            "--target_path",
-            str(target),
-            "--llm_addr",
-            "127.0.0.1",
-            "--llm_port",
-            "8000",
-            "--llm_name",
-            "Qwen/Qwen3-VL-8B-Instruct",
-            "--apply_nav_traj",
-            "--apply_up_route",
-            "--apply_recon_iteration",
-            "--force_vlm",
-        ]
-        env = os.environ.copy()
-        env["PYTHONPATH"] = f"{worldgen_root}:{HYWORLD2_SOURCE}"
-        env["PYTHONFAULTHANDLER"] = "1"
-        env["MODAL_WORLD_MESH_DEBUG_DIR"] = str(target / "mesh_debug")
-        stage_started = time.perf_counter()
-        with log_path.open("w") as log:
-            completed = subprocess.run(
-                command,
-                cwd=worldgen_root,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=False,
-                timeout=90 * 60,
-            )
-        stage1_s = time.perf_counter() - stage_started
-        timing = {
-            "vlm_load_s": round(vlm_load_s, 3),
-            "stage1_s": round(stage1_s, 3),
-            "peak_allocated_gb": round(torch.cuda.max_memory_allocated() / 1024**3, 3),
-            "returncode": completed.returncode,
-        }
-        (target / "wrapper_timing.json").write_text(
-            __import__("json").dumps(timing, indent=2) + "\n"
-        )
-        if completed.returncode != 0:
-            model_cache.commit()
-            worldgen_outputs.commit()
-            tail = log_path.read_text(errors="replace")[-20000:]
-            raise RuntimeError(f"WorldGen Stage 1 failed with exit {completed.returncode}:\n{tail}")
-    finally:
-        server.shutdown()
-        server.server_close()
-
-    required = [
-        target / "meta_info.json",
-        target / "objects.json",
-        target / "camera_trajectory",
-        target / "navmesh",
-        target / "render_results",
+    specs = [
+        ("Qwen/Qwen3-VL-8B-Instruct", None),
+        (
+            "naver-iv/zim-anything-vitl",
+            ["zim_vit_l_2092/**"],
+        ),
+        ("IDEA-Research/grounding-dino-tiny", None),
+        ("Ruicheng/moge-2-vitl-normal", None),
+        ("facebook/sam3", None),
     ]
-    missing = [str(path.relative_to(target)) for path in required if not path.exists()]
+    started = time.perf_counter()
+    repos = {}
+    for repo_id, allow_patterns in specs:
+        repo_started = time.perf_counter()
+        path = snapshot_download(
+            repo_id,
+            allow_patterns=allow_patterns,
+            max_workers=8,
+        )
+        repos[repo_id] = {
+            "path": path,
+            "elapsed_s": round(time.perf_counter() - repo_started, 3),
+        }
+        model_cache.commit()
+
+    zim = Path(repos["naver-iv/zim-anything-vitl"]["path"]) / "zim_vit_l_2092"
+    required = [zim / "encoder.onnx", zim / "decoder.onnx"]
+    missing = [str(path) for path in required if not path.is_file()]
     if missing:
-        raise RuntimeError(f"Stage 1 completed but required outputs are missing: {missing}")
-
-    files = []
-    total_bytes = 0
-    for path in sorted(target.rglob("*")):
-        if path.is_file():
-            size = path.stat().st_size
-            total_bytes += size
-            files.append({"path": str(path.relative_to(target)), "bytes": size})
-
-    peak_gb = torch.cuda.max_memory_allocated() / 1024**3
-    model_cache.commit()
-    worldgen_outputs.commit()
+        raise RuntimeError(f"Stage1 ZIM preload is incomplete: {missing}")
     return {
-        "gpu": torch.cuda.get_device_name(),
-        "capability": list(torch.cuda.get_device_capability()),
-        "torch": str(torch.__version__),
-        "vlm_load_s": round(vlm_load_s, 3),
-        "stage1_s": round(stage1_s, 3),
-        "peak_allocated_gb": round(peak_gb, 3),
-        "target": str(target),
-        "total_output_bytes": total_bytes,
-        "file_count": len(files),
-        "files": files,
-        "stage1_log_tail": (target / "stage1.log").read_text(errors="replace")[-8000:],
+        "elapsed_s": round(time.perf_counter() - started, 3),
+        "repos": repos,
+        "zim_required_files": [str(path) for path in required],
     }
 
 
 @app.function(
     image=hyworld2_worldgen_stage1_image,
-    gpu=GPU,
-    volumes={"/models": model_cache, "/worldgen": worldgen_outputs},
+    cpu=4.0,
+    memory=16384,
+    volumes={"/models": model_cache.with_mount_options(read_only=True)},
     secrets=[hf_secret],
-    timeout=2 * 60 * 60,
+    timeout=20 * 60,
 )
-def worldgen_case000_stage2() -> dict:
-    """Render Stage 1 trajectories and caption them with local Qwen3-VL."""
+def verify_worldnav_stage1_cache() -> dict:
+    """Verify Stage 1 assets resolve fully offline before allocating a GPU worker."""
     import json
     import os
-    import subprocess
-    import sys
     import time
-    import urllib.request
     from pathlib import Path
 
     os.environ["HF_HOME"] = "/models/huggingface"
     os.environ["HUGGINGFACE_HUB_CACHE"] = "/models/huggingface/hub"
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-    import torch
+    from huggingface_hub import snapshot_download
+    from transformers import AutoConfig, AutoProcessor
 
-    sys.path.insert(0, HYWORLD2_SOURCE)
-    from modal_world.qwen_vlm_server import Qwen3VLEngine, start_openai_server
+    started = time.perf_counter()
+    qwen_id = "Qwen/Qwen3-VL-8B-Instruct"
+    qwen_snapshot = Path(snapshot_download(qwen_id, local_files_only=True))
+    AutoConfig.from_pretrained(qwen_id, local_files_only=True)
+    AutoProcessor.from_pretrained(qwen_id, local_files_only=True)
 
-    target = Path("/worldgen/case000")
-    if not (target / "camera_trajectory/target_camera.json").is_file():
-        raise RuntimeError("Stage 1 camera trajectory is missing")
-    if not (target / "render_results/global_pcd.ply").is_file():
-        raise RuntimeError("Stage 1 global point cloud is missing")
+    index_path = qwen_snapshot / "model.safetensors.index.json"
+    if index_path.is_file():
+        index = json.loads(index_path.read_text())
+        shards = sorted({str(name) for name in index.get("weight_map", {}).values()})
+    else:
+        shards = ["model.safetensors"]
+    missing_shards = [name for name in shards if not (qwen_snapshot / name).is_file()]
+    if not shards or missing_shards:
+        raise RuntimeError(f"Qwen Stage1 cache incomplete: missing={missing_shards}")
 
-    camera_files = sorted(target.glob("render_results/view*/traj*/camera.json"))
-    renders = sorted(target.glob("render_results/view*/traj*/render.mp4"))
-    masks = sorted(target.glob("render_results/view*/traj*/render_mask.mp4"))
-    captions = sorted(target.glob("render_results/view*/traj*/traj_caption.json"))
-    if camera_files and len(camera_files) == len(renders) == len(masks) == len(captions):
-        for caption in captions:
-            payload = json.loads(caption.read_text())
-            if not str(payload.get("prompt", "")).strip():
-                raise RuntimeError(f"empty Stage 2 caption: {caption}")
-        return {
-            "resumed": True,
-            "stage2_s": 0.0,
-            "render_count": len(renders),
-            "mask_count": len(masks),
-            "caption_count": len(captions),
-            "render_bytes": sum(path.stat().st_size for path in renders),
-        }
+    other_specs = [
+        ("naver-iv/zim-anything-vitl", ["zim_vit_l_2092/**"]),
+        ("IDEA-Research/grounding-dino-tiny", None),
+        ("Ruicheng/moge-2-vitl-normal", None),
+        ("facebook/sam3", None),
+    ]
+    snapshots = {}
+    for repo_id, allow_patterns in other_specs:
+        snapshots[repo_id] = snapshot_download(
+            repo_id,
+            allow_patterns=allow_patterns,
+            local_files_only=True,
+        )
 
-    torch.cuda.reset_peak_memory_stats()
-    vlm_started = time.perf_counter()
-    engine = Qwen3VLEngine("Qwen/Qwen3-VL-8B-Instruct")
-    server, _thread = start_openai_server(engine, port=8000)
-    vlm_load_s = time.perf_counter() - vlm_started
-    model_cache.commit()
+    zim = Path(snapshots["naver-iv/zim-anything-vitl"]) / "zim_vit_l_2092"
+    zim_required = [zim / "encoder.onnx", zim / "decoder.onnx"]
+    missing_zim = [str(path) for path in zim_required if not path.is_file()]
+    if missing_zim:
+        raise RuntimeError(f"Stage1 ZIM cache incomplete: {missing_zim}")
 
-    log_path = target / "stage2.log"
-    timing_path = target / "stage2_timing.json"
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:8000/v1/models", timeout=5) as response:
-            if response.status != 200:
-                raise RuntimeError(f"local Qwen3-VL server unhealthy: {response.status}")
-
-        worldgen_root = Path(HYWORLD2_SOURCE) / "hyworld2/worldgen"
-        command = [
-            sys.executable,
-            "-X",
-            "faulthandler",
-            "-u",
-            "-m",
-            "torch.distributed.run",
-            "--standalone",
-            "--nproc_per_node=1",
-            "traj_render.py",
-            "--target_path",
-            str(target),
-            "--llm_addr",
-            "127.0.0.1",
-            "--llm_port",
-            "8000",
-            "--llm_name",
-            "Qwen/Qwen3-VL-8B-Instruct",
-        ]
-        env = os.environ.copy()
-        env["PYTHONPATH"] = f"{worldgen_root}:{HYWORLD2_SOURCE}"
-        env["PYTHONFAULTHANDLER"] = "1"
-        started = time.perf_counter()
-        with log_path.open("w") as log:
-            completed = subprocess.run(
-                command,
-                cwd=worldgen_root,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=False,
-                timeout=90 * 60,
-            )
-        stage2_s = time.perf_counter() - started
-        timing = {
-            "vlm_load_s": round(vlm_load_s, 3),
-            "stage2_s": round(stage2_s, 3),
-            "peak_allocated_gb": round(torch.cuda.max_memory_allocated() / 1024**3, 3),
-            "returncode": completed.returncode,
-        }
-        timing_path.write_text(json.dumps(timing, indent=2) + "\n")
-        worldgen_outputs.commit()
-        if completed.returncode != 0:
-            tail = log_path.read_text(errors="replace")[-24000:]
-            raise RuntimeError(f"WorldGen Stage 2 failed with exit {completed.returncode}:\n{tail}")
-    finally:
-        server.shutdown()
-        server.server_close()
-
-    renders = sorted(target.glob("render_results/*/traj*/render.mp4"))
-    masks = sorted(target.glob("render_results/*/traj*/render_mask.mp4"))
-    captions = sorted(target.glob("render_results/*/traj*/traj_caption.json"))
-    if not renders:
-        raise RuntimeError("Stage 2 completed without rendered trajectory videos")
-    if len(masks) != len(renders):
-        raise RuntimeError(f"Stage 2 render/mask count mismatch: {len(renders)} vs {len(masks)}")
-    if not captions:
-        raise RuntimeError("Stage 2 completed without trajectory captions")
-
-    worldgen_outputs.commit()
     return {
-        "gpu": torch.cuda.get_device_name(),
-        "capability": list(torch.cuda.get_device_capability()),
-        "torch": str(torch.__version__),
-        "vlm_load_s": round(vlm_load_s, 3),
-        "stage2_s": round(stage2_s, 3),
-        "peak_allocated_gb": round(torch.cuda.max_memory_allocated() / 1024**3, 3),
-        "render_count": len(renders),
-        "mask_count": len(masks),
-        "caption_count": len(captions),
-        "render_bytes": sum(path.stat().st_size for path in renders),
-        "stage2_log_tail": log_path.read_text(errors="replace")[-8000:],
+        "success": True,
+        "offline": True,
+        "qwen_snapshot": str(qwen_snapshot),
+        "qwen_weight_shards": len(shards),
+        "qwen_weight_bytes": sum((qwen_snapshot / name).stat().st_size for name in shards),
+        "other_snapshots": snapshots,
+        "elapsed_s": round(time.perf_counter() - started, 3),
     }
+
+
+@app.function(image=base_image, timeout=2 * 60 * 60)
+def worldgen_case000_stage2(job_id: str = "case000") -> dict:
+    """Dispatch Stage 2 to the deployed persistent WorldNav renderer worker."""
+    worker_cls = modal.Cls.from_name("modal-world-stage2", "WorldNavRenderer")
+    return _spawn_worker_call(worker_cls().render, job_id=job_id, wait_timeout_s=30 * 60)
 
 
 @app.function(
@@ -691,6 +416,7 @@ def preload_worldstereo_stage3_weights() -> dict:
         ("Ruicheng/moge-2-vitl-normal", None),
         ("facebook/sam3", None),
         ("facebook/dinov2-base", None),
+        ("tencent/HY-World-2.0", ["HY-WorldMirror-2.0/**"]),
     ]
     for repo_id, allow_patterns in specs:
         repo_started = time.perf_counter()
@@ -744,6 +470,8 @@ def verify_worldstereo_stage3_cache() -> dict:
     from transformers import AutoConfig, AutoImageProcessor, CLIPImageProcessor, T5TokenizerFast
 
     worldstereo_repo = "hanshanxue/WorldStereo"
+    worldmirror_repo = "tencent/HY-World-2.0"
+    worldmirror_subfolder = "HY-WorldMirror-2.0"
     wan_repo = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
     report_path = Path("/models/stage3_cache_verify.json")
     report = {"offline": True, "steps": {}, "required_paths": {}}
@@ -786,6 +514,35 @@ def verify_worldstereo_stage3_cache() -> dict:
             local_files_only=True,
         ),
     )
+    worldmirror_snapshot = Path(
+        checked(
+            "worldmirror_snapshot",
+            lambda: snapshot_download(
+                worldmirror_repo,
+                allow_patterns=[f"{worldmirror_subfolder}/**"],
+                local_files_only=True,
+            ),
+        )
+    )
+    worldmirror_dir = worldmirror_snapshot / worldmirror_subfolder
+    worldmirror_weights = worldmirror_dir / "model.safetensors"
+    worldmirror_configs = [
+        worldmirror_dir / "config.yaml",
+        worldmirror_dir / "config.json",
+    ]
+    if not worldmirror_weights.is_file() or not any(path.is_file() for path in worldmirror_configs):
+        raise RuntimeError(
+            "WorldMirror cache incomplete: "
+            f"weights={worldmirror_weights.is_file()} "
+            f"config={any(path.is_file() for path in worldmirror_configs)} "
+            f"dir={worldmirror_dir}"
+        )
+    report["required_paths"]["worldmirror_snapshot"] = str(worldmirror_snapshot)
+    report["required_paths"]["worldmirror_weights"] = str(worldmirror_weights)
+    report["required_paths"]["worldmirror_config"] = str(
+        next(path for path in worldmirror_configs if path.is_file())
+    )
+
     report["required_paths"]["wan_snapshot"] = checked(
         "wan_snapshot",
         lambda: snapshot_download(
@@ -866,6 +623,7 @@ def verify_worldstereo_stage3_cache() -> dict:
         "moge": cache / "models--Ruicheng--moge-2-vitl-normal" / "blobs",
         "sam3": cache / "models--facebook--sam3" / "blobs",
         "dinov2": cache / "models--facebook--dinov2-base" / "blobs",
+        "worldmirror": cache / "models--tencent--HY-World-2.0" / "blobs",
     }
     blob_bytes = {}
     blob_files = {}
@@ -892,167 +650,11 @@ def verify_worldstereo_stage3_cache() -> dict:
     return report
 
 
-@app.function(
-    image=hyworld2_worldgen_stage3_image,
-    gpu=GPU,
-    cpu=16.0,
-    memory=131072,
-    volumes={"/models": model_cache, "/worldgen": worldgen_outputs},
-    secrets=[hf_secret],
-    timeout=4 * 60 * 60,
-)
-def worldgen_case000_stage3() -> dict:
-    """Run single-GPU WorldStereo-2 DMD expansion with fully preloaded weights."""
-    import json
-    import os
-    import subprocess
-    import sys
-    import threading
-    import time
-    from pathlib import Path
-
-    os.environ["HF_HOME"] = "/models/huggingface"
-    os.environ["HUGGINGFACE_HUB_CACHE"] = "/models/huggingface/hub"
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    os.environ["DIFFUSERS_OFFLINE"] = "1"
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/models/torchinductor"
-    os.environ["TRITON_CACHE_DIR"] = "/models/triton"
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-    target = Path("/worldgen/case000")
-    camera_files = sorted(target.glob("render_results/view*/traj*/camera.json"))
-    renders = sorted(target.glob("render_results/view*/traj*/render.mp4"))
-    masks = sorted(target.glob("render_results/view*/traj*/render_mask.mp4"))
-    captions = sorted(target.glob("render_results/view*/traj*/traj_caption.json"))
-    if not camera_files or not (len(camera_files) == len(renders) == len(masks) == len(captions)):
-        raise RuntimeError(
-            f"Stage 2 incomplete: cameras={len(camera_files)} renders={len(renders)} "
-            f"masks={len(masks)} captions={len(captions)}"
-        )
-    for caption in captions:
-        payload = json.loads(caption.read_text())
-        if not str(payload.get("prompt", "")).strip():
-            raise RuntimeError(f"empty Stage 2 caption: {caption}")
-
-    worldgen_root = Path(HYWORLD2_SOURCE) / "hyworld2/worldgen"
-    from modal_world.worldstereo_patch import patch_worldstereo_wrapper
-
-    patch_worldstereo_wrapper(worldgen_root / "models/worldstereo_wrapper.py")
-
-    retrieval_path = worldgen_root / "src/retrieval_wm.py"
-    retrieval_source = retrieval_path.read_text()
-    dino_processor_old = "            self.processor = AutoImageProcessor.from_pretrained(model_path, use_fast=True)\n"
-    dino_processor_new = (
-        "            self.processor = AutoImageProcessor.from_pretrained(\n"
-        "                model_path, use_fast=True, local_files_only=True\n"
-        "            )\n"
-    )
-    dino_model_old = (
-        "            self.model = AutoModel.from_pretrained(model_path).to(self.device)\n"
-    )
-    dino_model_new = (
-        "            self.model = AutoModel.from_pretrained(\n"
-        "                model_path, local_files_only=True\n"
-        "            ).to(self.device)\n"
-    )
-    if retrieval_source.count(dino_processor_old) != 1:
-        raise RuntimeError("expected pinned DINO processor loader not found")
-    if retrieval_source.count(dino_model_old) != 1:
-        raise RuntimeError("expected pinned DINO model loader not found")
-    retrieval_source = retrieval_source.replace(dino_processor_old, dino_processor_new, 1)
-    retrieval_source = retrieval_source.replace(dino_model_old, dino_model_new, 1)
-    retrieval_path.write_text(retrieval_source)
-
-    log_path = target / "stage3.log"
-    timing_path = target / "stage3_timing.json"
-    command = [
-        sys.executable,
-        "-X",
-        "faulthandler",
-        "-u",
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nproc_per_node=1",
-        "video_gen.py",
-        "--target_path",
-        str(target),
-        "--model_type",
-        "worldstereo-memory-dmd",
-        "--local_files_only",
-        "--skip_exist",
-    ]
-    env = os.environ.copy()
-    env["PYTHONPATH"] = f"{worldgen_root}:{HYWORLD2_SOURCE}"
-    env["PYTHONFAULTHANDLER"] = "1"
-
-    stop_monitor = threading.Event()
-    gpu_peak_mib = 0
-
-    def monitor_gpu() -> None:
-        nonlocal gpu_peak_mib
-        while not stop_monitor.wait(1.0):
-            try:
-                raw = subprocess.check_output(
-                    [
-                        "nvidia-smi",
-                        "--query-gpu=memory.used",
-                        "--format=csv,noheader,nounits",
-                    ],
-                    text=True,
-                    timeout=5,
-                ).splitlines()[0]
-                gpu_peak_mib = max(gpu_peak_mib, int(raw.strip()))
-            except (subprocess.SubprocessError, ValueError, IndexError):
-                pass
-
-    monitor = threading.Thread(target=monitor_gpu, daemon=True)
-    monitor.start()
-    started = time.perf_counter()
-    try:
-        with log_path.open("w") as log:
-            completed = subprocess.run(
-                command,
-                cwd=worldgen_root,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=False,
-                timeout=3 * 60 * 60,
-            )
-    finally:
-        stop_monitor.set()
-        monitor.join(timeout=5)
-
-    stage3_s = time.perf_counter() - started
-    results = sorted(target.glob("render_results/*/traj*/worldstereo-memory-dmd_result.mp4"))
-    aligned_pcd = target / "render_results/generation_bank_worldstereo-memory-dmd/aligned_pcd.ply"
-    timing = {
-        "stage3_s": round(stage3_s, 3),
-        "gpu_peak_used_mib": gpu_peak_mib,
-        "returncode": completed.returncode,
-        "result_count": len(results),
-        "aligned_pcd_exists": aligned_pcd.is_file(),
-    }
-    timing_path.write_text(json.dumps(timing, indent=2) + "\n")
-    model_cache.commit()
-    worldgen_outputs.commit()
-    if completed.returncode != 0:
-        tail = log_path.read_text(errors="replace")[-30000:]
-        raise RuntimeError(f"WorldGen Stage 3 failed with exit {completed.returncode}:\n{tail}")
-    if len(results) != len(camera_files):
-        raise RuntimeError(f"Stage 3 result count mismatch: {len(results)} vs {len(camera_files)}")
-    if not aligned_pcd.is_file():
-        raise RuntimeError("Stage 3 completed without aligned memory-bank point cloud")
-    return {
-        **timing,
-        "result_bytes": sum(path.stat().st_size for path in results),
-        "aligned_pcd_bytes": aligned_pcd.stat().st_size,
-        "stage3_log_tail": log_path.read_text(errors="replace")[-8000:],
-    }
+@app.function(image=base_image, timeout=4 * 60 * 60)
+def worldgen_case000_stage3(job_id: str = "case000") -> dict:
+    """Dispatch Stage 3 to the deployed persistent WorldStereo worker."""
+    worker_cls = modal.Cls.from_name("modal-world-stage3", "WorldStereoWorker")
+    return _spawn_worker_call(worker_cls().generate, job_id=job_id, wait_timeout_s=45 * 60)
 
 
 @app.function(
@@ -1060,11 +662,15 @@ def worldgen_case000_stage3() -> dict:
     gpu=GPU,
     cpu=8.0,
     memory=32768,
-    volumes={"/models": model_cache, "/worldgen": worldgen_outputs},
+    volumes={
+        "/models": model_cache.with_mount_options(read_only=True),
+        "/runtime-cache": runtime_cache,
+        "/worldgen": worldgen_outputs,
+    },
     secrets=[hf_secret],
     timeout=60 * 60,
 )
-def worldgen_case000_stage4() -> dict:
+def worldgen_case000_stage4(job_id: str = "case000") -> dict:
     """Prepare official HYWorld2 3DGS training data on one RTX PRO 6000."""
     import json
     import os
@@ -1080,8 +686,13 @@ def worldgen_case000_stage4() -> dict:
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["CUDA_CACHE_PATH"] = "/runtime-cache/cuda-cache"
+    os.environ["CUDA_CACHE_MAXSIZE"] = str(4 * 1024**3)
+    os.environ["TORCH_EXTENSIONS_DIR"] = "/runtime-cache/torch-extensions"
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/runtime-cache/torchinductor"
+    os.environ["TRITON_CACHE_DIR"] = "/runtime-cache/triton"
 
-    target = Path("/worldgen/case000")
+    target = resolve_worldgen_job_root(job_id)
     generation_bank = target / "render_results/generation_bank_worldstereo-memory-dmd"
     required_stage3 = [generation_bank / "global_pcd.ply", generation_bank / "aligned_pcd.ply"]
     missing_stage3 = [
@@ -1089,6 +700,18 @@ def worldgen_case000_stage4() -> dict:
     ]
     if missing_stage3:
         raise RuntimeError(f"Stage 3 incomplete: missing {missing_stage3}")
+
+    stage4_inputs = [*required_stage3]
+    pcd_info = generation_bank / "pcd_info.json"
+    if pcd_info.is_file():
+        stage4_inputs.append(pcd_info)
+    stage4_manifest = build_stage_manifest(
+        job_id=job_id,
+        stage="stage4",
+        hyworld_revision=HYWORLD2_REVISION,
+        input_fingerprint=fingerprint_files(stage4_inputs, root=target),
+        config={"save_normal": True, "split_sky": True, "split_align": False},
+    )
 
     gs_data = target / "gs_data"
     cameras_path = gs_data / "cameras.json"
@@ -1101,28 +724,29 @@ def worldgen_case000_stage4() -> dict:
         depths = sorted((gs_data / "depths").glob("*.png"))
         normals = sorted((gs_data / "normals").glob("*.png"))
         if camera_count and len(images) == camera_count and len(normals) == camera_count:
-            return {
-                "resumed": True,
-                "stage4_s": 0.0,
-                "camera_count": camera_count,
-                "image_count": len(images),
-                "depth_count": len(depths),
-                "normal_count": len(normals),
-                "points_bytes": points_path.stat().st_size,
-                "sky_points_bytes": sky_points_path.stat().st_size,
-            }
+            manifest_ok = manifest_matches(target, "stage4", stage4_manifest)
+            legacy_adopted = (
+                job_id == "case000" and not stage_manifest_path(target, "stage4").exists()
+            )
+            if manifest_ok or legacy_adopted:
+                if legacy_adopted:
+                    write_stage_manifest(target, "stage4", stage4_manifest)
+                    worldgen_outputs.commit()
+                return {
+                    "resumed": True,
+                    "manifest_adopted": legacy_adopted,
+                    "stage4_s": 0.0,
+                    "camera_count": camera_count,
+                    "image_count": len(images),
+                    "depth_count": len(depths),
+                    "normal_count": len(normals),
+                    "points_bytes": points_path.stat().st_size,
+                    "sky_points_bytes": (
+                        sky_points_path.stat().st_size if sky_points_path.is_file() else 0
+                    ),
+                }
 
     worldgen_root = Path(HYWORLD2_SOURCE) / "hyworld2/worldgen"
-    script_path = worldgen_root / "gen_gs_data.py"
-    script_source = script_path.read_text()
-    moge_old = 'MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to(device)'
-    moge_new = (
-        'MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal", local_files_only=True).to(device)'
-    )
-    if script_source.count(moge_old) != 1:
-        raise RuntimeError("expected pinned Stage 4 MoGe loader not found")
-    script_path.write_text(script_source.replace(moge_old, moge_new, 1))
-
     log_path = target / "stage4.log"
     timing_path = target / "stage4_timing.json"
     command = [
@@ -1130,10 +754,6 @@ def worldgen_case000_stage4() -> dict:
         "-X",
         "faulthandler",
         "-u",
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nproc_per_node=1",
         "gen_gs_data.py",
         "--root_path",
         str(target),
@@ -1143,9 +763,12 @@ def worldgen_case000_stage4() -> dict:
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{worldgen_root}:{HYWORLD2_SOURCE}"
     env["PYTHONFAULTHANDLER"] = "1"
+    env["RANK"] = "0"
+    env["LOCAL_RANK"] = "0"
+    env["WORLD_SIZE"] = "1"
 
     stop_monitor = threading.Event()
-    gpu_peak_mib = 0
+    gpu_peak_mib = None
 
     def monitor_gpu() -> None:
         nonlocal gpu_peak_mib
@@ -1160,12 +783,15 @@ def worldgen_case000_stage4() -> dict:
                     text=True,
                     timeout=5,
                 ).splitlines()[0]
-                gpu_peak_mib = max(gpu_peak_mib, int(raw.strip()))
+                sample_mib = int(raw.strip())
+                gpu_peak_mib = max(gpu_peak_mib or 0, sample_mib)
             except (subprocess.SubprocessError, ValueError, IndexError):
                 pass
 
-    monitor = threading.Thread(target=monitor_gpu, daemon=True)
-    monitor.start()
+    monitor = None
+    if os.environ.get("MODAL_WORLD_DEBUG_GPU_SAMPLER") == "1":
+        monitor = threading.Thread(target=monitor_gpu, daemon=True)
+        monitor.start()
     started = time.perf_counter()
     try:
         with log_path.open("w") as log:
@@ -1180,8 +806,9 @@ def worldgen_case000_stage4() -> dict:
                 timeout=50 * 60,
             )
     finally:
-        stop_monitor.set()
-        monitor.join(timeout=5)
+        if monitor is not None:
+            stop_monitor.set()
+            monitor.join(timeout=5)
 
     stage4_s = time.perf_counter() - started
     camera_count = 0
@@ -1194,6 +821,7 @@ def worldgen_case000_stage4() -> dict:
     timing = {
         "stage4_s": round(stage4_s, 3),
         "gpu_peak_used_mib": gpu_peak_mib,
+        "gpu_sampler_enabled": monitor is not None,
         "returncode": completed.returncode,
         "camera_count": camera_count,
         "image_count": len(images),
@@ -1216,10 +844,12 @@ def worldgen_case000_stage4() -> dict:
             f"normals={len(normals)} depths={len(depths)}"
         )
 
+    write_stage_manifest(target, "stage4", stage4_manifest)
+    worldgen_outputs.commit()
     return {
         **timing,
         "points_bytes": points_path.stat().st_size,
-        "sky_points_bytes": sky_points_path.stat().st_size,
+        "sky_points_bytes": (sky_points_path.stat().st_size if sky_points_path.is_file() else 0),
         "stage4_log_tail": log_path.read_text(errors="replace")[-8000:],
     }
 
@@ -1338,7 +968,7 @@ def preflight_worldgen_case000_stage5() -> dict:
     volumes={"/models": model_cache, "/worldgen": worldgen_outputs},
     timeout=20 * 60,
 )
-def worldgen_case000_stage5_smoke() -> dict:
+def worldgen_case000_stage5_smoke(job_id: str = "case000") -> dict:
     """Run a short real 3DGS optimization to validate the final world-generation stage."""
     import json
     import os
@@ -1354,7 +984,7 @@ def worldgen_case000_stage5_smoke() -> dict:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     os.environ["PYTHONFAULTHANDLER"] = "1"
 
-    target = Path("/worldgen/case000")
+    target = resolve_worldgen_job_root(job_id)
     data_dir = target / "gs_data"
     result_dir = target / "gs_smoke_result"
     if result_dir.exists():

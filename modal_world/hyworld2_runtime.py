@@ -4,6 +4,11 @@ from typing import Any
 
 import modal
 
+from .stage1_patch import patch_stage1_worldnav
+from .stage2_patch import patch_stage2_single_gpu
+from .stage3_patch import patch_stage3_runtime
+from .stage4_patch import patch_stage4_single_gpu
+
 ARTIFACT_VOLUME_NAME = "modal-build-artifacts"
 GPU = "RTX-PRO-6000"
 PYTHON = "3.11"
@@ -132,6 +137,9 @@ hyworld2_worldmirror_image = (
 
 hyworld2_worldgen_stage1_image = (
     hyworld2_worldmirror_image.apt_install("ffmpeg", "libgomp1")
+    .run_function(patch_stage1_worldnav, args=(HYWORLD2_SOURCE,))
+    .run_function(patch_stage2_single_gpu, args=(HYWORLD2_SOURCE,))
+    .run_function(patch_stage4_single_gpu, args=(HYWORLD2_SOURCE,))
     .pip_install(
         "transformers==5.2.0",
         "accelerate>=1.10,<2",
@@ -151,6 +159,7 @@ hyworld2_worldgen_stage1_image = (
         "onnxruntime-gpu>=1.20,<2",
         "pycocotools>=2.0.8,<3",
         "cupy-cuda12x==13.6.0",
+        "rtree==1.4.1",
     )
     .run_commands(
         "python -m pip install --no-deps 'git+https://github.com/EasternJournalist/utils3d.git@c5daf6f6c244d251f252102d09e9b7bcef791a38'",
@@ -158,10 +167,10 @@ hyworld2_worldgen_stage1_image = (
 )
 
 
-hyworld2_worldgen_stage3_image = hyworld2_worldgen_stage1_image.apt_install(
-    "build-essential", "ninja-build"
-).pip_install(
-    "imagesize==1.4.1",
+hyworld2_worldgen_stage3_image = (
+    hyworld2_worldgen_stage1_image.run_function(patch_stage3_runtime, args=(HYWORLD2_SOURCE,))
+    .apt_install("build-essential", "ninja-build")
+    .pip_install("imagesize==1.4.1")
 )
 
 hyworld2_worldgen_stage5_image = hyworld2_worldgen_stage3_image.pip_install(

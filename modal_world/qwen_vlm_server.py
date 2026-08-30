@@ -5,6 +5,7 @@ import io
 import json
 import threading
 import time
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -55,18 +56,38 @@ def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return normalized
 
 
+@dataclass
+class _PendingChat:
+    body: dict[str, Any]
+    event: threading.Event = field(default_factory=threading.Event)
+    result: dict[str, Any] | None = None
+    error: Exception | None = None
+
+
 class Qwen3VLEngine:
-    def __init__(self, model_id: str = "Qwen/Qwen3-VL-8B-Instruct") -> None:
+    def __init__(
+        self,
+        model_id: str = "Qwen/Qwen3-VL-8B-Instruct",
+        *,
+        max_batch_size: int = 3,
+        batch_window_s: float = 0.03,
+    ) -> None:
         import torch
         from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
         self.torch = torch
         self.model_id = model_id
+        self.max_batch_size = max(1, int(max_batch_size))
+        self.batch_window_s = max(0.0, float(batch_window_s))
         self._generation_lock = threading.Lock()
+        self._batch_condition = threading.Condition()
+        self._pending_chats: list[_PendingChat] = []
+        self._batch_leader = False
         started = time.perf_counter()
-        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.processor = AutoProcessor.from_pretrained(model_id, local_files_only=True)
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_id,
+            local_files_only=True,
             dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
             device_map="cuda",
@@ -74,54 +95,132 @@ class Qwen3VLEngine:
         torch.cuda.synchronize()
         self.load_s = time.perf_counter() - started
 
-    def chat(self, body: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _generation_signature(body: dict[str, Any]) -> tuple[int, float, float, int]:
+        return (
+            min(int(body.get("max_tokens", 1024)), 2048),
+            float(body.get("temperature", 0.0)),
+            float(body.get("top_p", 1.0)),
+            int(body.get("seed", 1024)),
+        )
+
+    def _chat_batch(self, bodies: list[dict[str, Any]]) -> list[dict[str, Any]]:
         torch = self.torch
-        messages = body.get("messages")
-        if not isinstance(messages, list) or not messages:
-            raise ValueError("messages is required")
-        normalized = _normalize_messages(messages)
+        if not bodies:
+            return []
+        conversations = []
+        for body in bodies:
+            messages = body.get("messages")
+            if not isinstance(messages, list) or not messages:
+                raise ValueError("messages is required")
+            conversations.append(_normalize_messages(messages))
+
         inputs = self.processor.apply_chat_template(
-            normalized,
+            conversations,
             tokenize=True,
             add_generation_prompt=True,
             return_dict=True,
             return_tensors="pt",
+            padding=True,
         ).to(self.model.device)
 
-        seed = int(body.get("seed", 1024))
+        max_tokens, temperature, top_p, seed = self._generation_signature(bodies[0])
         torch.manual_seed(seed)
-        max_tokens = min(int(body.get("max_tokens", 1024)), 2048)
-        temperature = float(body.get("temperature", 0.0))
         generate_kwargs: dict[str, Any] = {"max_new_tokens": max_tokens, "do_sample": False}
         if temperature > 0:
             generate_kwargs.update(
                 {
                     "do_sample": True,
                     "temperature": max(temperature, 1e-5),
-                    "top_p": float(body.get("top_p", 1.0)),
+                    "top_p": top_p,
                 }
             )
         with self._generation_lock, torch.inference_mode():
             generated = self.model.generate(**inputs, **generate_kwargs)
-        trimmed = [out[len(inp) :] for inp, out in zip(inputs.input_ids, generated)]
-        text = self.processor.batch_decode(
+
+        prompt_width = inputs.input_ids.shape[1]
+        trimmed = generated[:, prompt_width:]
+        texts = self.processor.batch_decode(
             trimmed,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
-        )[0].strip()
-        return {
-            "id": f"chatcmpl-local-{time.time_ns()}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": body.get("model") or self.model_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
-                }
-            ],
-        }
+        )
+        now = int(time.time())
+        return [
+            {
+                "id": f"chatcmpl-local-{time.time_ns()}-{index}",
+                "object": "chat.completion",
+                "created": now,
+                "model": body.get("model") or self.model_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": text.strip()},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+            for index, (body, text) in enumerate(zip(bodies, texts, strict=True))
+        ]
+
+    def _take_compatible_batch(self) -> list[_PendingChat]:
+        with self._batch_condition:
+            if not self._pending_chats:
+                return []
+            signature = self._generation_signature(self._pending_chats[0].body)
+            selected: list[_PendingChat] = []
+            remaining: list[_PendingChat] = []
+            for request in self._pending_chats:
+                if (
+                    len(selected) < self.max_batch_size
+                    and self._generation_signature(request.body) == signature
+                ):
+                    selected.append(request)
+                else:
+                    remaining.append(request)
+            self._pending_chats = remaining
+            return selected
+
+    def _drain_microbatches(self) -> None:
+        if self.batch_window_s:
+            time.sleep(self.batch_window_s)
+        while True:
+            batch = self._take_compatible_batch()
+            if not batch:
+                with self._batch_condition:
+                    if self._pending_chats:
+                        continue
+                    self._batch_leader = False
+                return
+            try:
+                results = self._chat_batch([request.body for request in batch])
+            except Exception as exc:  # noqa: BLE001 - batch boundary must wake all waiters
+                for request in batch:
+                    request.error = exc
+                    request.event.set()
+            else:
+                for request, result in zip(batch, results, strict=True):
+                    request.result = result
+                    request.event.set()
+
+    def chat(self, body: dict[str, Any]) -> dict[str, Any]:
+        request = _PendingChat(body=body)
+        with self._batch_condition:
+            self._pending_chats.append(request)
+            leader = not self._batch_leader
+            if leader:
+                self._batch_leader = True
+
+        if leader:
+            self._drain_microbatches()
+        else:
+            request.event.wait()
+
+        if request.error is not None:
+            raise request.error
+        if request.result is None:
+            raise RuntimeError("Qwen3-VL microbatch completed without a result")
+        return request.result
 
 
 def start_openai_server(engine: Qwen3VLEngine, host: str = "127.0.0.1", port: int = 8000):

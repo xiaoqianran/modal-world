@@ -63,8 +63,7 @@ The runtime uses pinned HYWorld2/native artifacts and persistent Modal model/out
 ## Modal packaging direction
 
 Keep HYWorld2/CUDA/Torch/gsplat/model weights in a HYWorld2-specific Modal image/volume. The generic provider
-package should remain lightweight. The canonical integration lives in `modal-provider/modal-world/` without changing the external provider contract.
-This standalone repository is retained as a syncable package/CI surface; the monorepo is the integration source of truth.
+package should remain lightweight. `modal-provider/modal-world/` is the sole source of truth. The former standalone repository is retired from the development and sync workflow.
 
 ## Development
 
